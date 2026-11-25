@@ -1,0 +1,483 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>USB 键鼠设备设计文档 — 民展人才联合培养项目考核</title>
+<style>
+  :root { --ink:#1f2933; --blue:#12335b; --line:#c9d3df; --soft:#eaf1f9; --bg:#ffffff; }
+  * { box-sizing:border-box; }
+  body { font-family:"Microsoft YaHei","PingFang SC","Segoe UI",sans-serif; color:var(--ink);
+         background:var(--bg); max-width:1000px; margin:0 auto; padding:36px 40px 64px; line-height:1.8; }
+  h1 { color:var(--blue); font-size:28px; border-bottom:3px solid var(--blue); padding-bottom:12px; margin-bottom:6px; }
+  h2 { color:var(--blue); font-size:21px; margin-top:36px; border-left:6px solid var(--blue); padding-left:12px; }
+  h3 { color:#2a4d77; font-size:17px; margin-top:24px; }
+  .sub { color:#5b6b7f; font-size:14px; margin-bottom:24px; }
+  p { margin:10px 0; }
+  table { border-collapse:collapse; width:100%; margin:14px 0; font-size:14px; }
+  th,td { border:1px solid var(--line); padding:9px 11px; text-align:left; vertical-align:top; }
+  th { background:var(--soft); color:var(--blue); font-weight:600; }
+  tr:nth-child(even) td { background:#fafcff; }
+  code { font-family:Consolas,"Courier New",monospace; background:#f1f5fa; padding:1px 5px; border-radius:3px; font-size:13px; }
+  pre { background:#f6f8fb; border:1px solid var(--line); border-left:4px solid #2f6fb5;
+        padding:12px 16px; overflow-x:auto; font-size:13px; line-height:1.6; }
+  .note { border-left:4px solid #2f6fb5; background:#f4f8fd; padding:10px 16px; margin:14px 0; }
+  .warn { border-left:4px solid #c47b17; background:#fff8ec; padding:10px 16px; margin:14px 0; }
+  svg { width:100%; height:auto; border:1px solid var(--line); border-radius:6px; margin:14px 0; background:#fff; }
+  .cap { text-align:center; color:#5b6b7f; font-size:13px; margin:-6px 0 20px; }
+  ul,ol { padding-left:24px; }
+  .toc { background:#f7fafd; border:1px solid var(--line); padding:14px 22px; }
+  .toc a { color:#1a4d8f; text-decoration:none; }
+  .toc a:hover { text-decoration:underline; }
+  @media print { body { padding:0; } h2 { page-break-after:avoid; } svg,table,pre { page-break-inside:avoid; } }
+</style>
+</head>
+<body>
+
+<h1>USB + 蓝牙双模键鼠设备设计文档</h1>
+<div class="sub">民展人才联合培养项目考核 · 课题一「USB 键鼠设备」　|　主控 STM32F103RCT6 + RDA5876　|　TinyUSB（Device）+ 裸 HCI 主机栈<br>
+版本：V2.2　日期：2026-11-17　固件：<code>Project.hex</code>（Code=56620，0 Error；HIDP 支持 Boot + Report 双协议，通道建立主动补发首帧报告）</div>
+
+<div class="toc">
+<strong>目录</strong>
+<ol>
+  <li><a href="#s1">功能描述</a></li>
+  <li><a href="#s2">设计思路</a></li>
+  <li><a href="#s3">原理框图</a></li>
+  <li><a href="#s4">软件流程图</a></li>
+  <li><a href="#s5">HID 接口与报告格式</a></li>
+  <li><a href="#s6">键位映射</a></li>
+  <li><a href="#s7">自定义 HID 通信协议</a></li>
+  <li><a href="#s8">编译、烧录与验证</a></li>
+  <li><a href="#s9">考核项对应与待办</a></li>
+  <li><a href="#s10">双模扩展：蓝牙键鼠</a></li>
+</ol>
+</div>
+
+<h2 id="s1">1 功能描述</h2>
+
+<p>本设备是一个 <strong>USB 全速复合 HID 设备</strong>，并同时通过板载 RDA5876 提供<strong>蓝牙 HID 键盘 + 鼠标</strong>。两条链路共用同一套板载按键与摇杆，由自动选路决定输入往哪边发（见第 10 章）。USB 侧插入电脑后，Windows 会枚举出三个彼此独立的 HID 接口，各自使用系统自带驱动，不需要安装任何驱动程序：</p>
+
+<table>
+<tr><th>接口</th><th>功能</th><th>端点</th><th>电脑侧表现</th></tr>
+<tr><td>Interface 0</td><td>标准键盘（Boot Keyboard）</td><td>中断 IN <code>0x81</code></td><td>「HID 键盘设备」，Caps Lock / Num Lock / 空格 / 回车</td></tr>
+<tr><td>Interface 1</td><td>标准鼠标（Boot Mouse）</td><td>中断 IN <code>0x82</code></td><td>「HID 鼠标设备」，光标、滚轮、左右键</td></tr>
+<tr><td>Interface 2</td><td>自定义 HID（Vendor Defined）</td><td>中断 IN <code>0x83</code> / OUT <code>0x03</code></td><td>「HID-compliant device」，供上位机专用</td></tr>
+</table>
+
+<h3>已实现的板载功能</h3>
+<ul>
+  <li><strong>鼠标</strong>：左摇杆控制光标 X/Y 相对位移（先按板上 90° 安装做旋转修正，再用「死区 + 平方曲线」控制速度）；A / B / LF 分别对应左键 / 右键 / 中键；右摇杆控制滚轮（每 100ms 一格，防止疯狂滚动）。UP / DN 不再控制滚轮。</li>
+  <li><strong>键盘</strong>：X 键发送 <code>Caps Lock</code>（HID 键码 0x39），Y 键发送 <code>Num Lock</code>（0x53），UP 键发送<strong>空格 Space</strong>（0x2C），DN 键发送<strong>回车 Enter</strong>（0x28，主键盘回车，不是小键盘的 0x58）；四个键都采用「按下 30ms 后自动补发释放报告」的点按方式，避免 Windows 认为按键一直按着而反复切换或连续输入。</li>
+  <li><strong>锁定指示灯</strong>：主机通过 <code>SET_REPORT</code> 下发键盘 LED 状态后，板载 RGB 灯的<strong>绿灯表示 Num Lock、红灯表示 Caps Lock</strong>，与电脑实际锁定状态同步，而不是「按一下闪一下」。</li>
+  <li><strong>自定义 HID 上行</strong>：8 个板载按键组成位图，状态变化时立即上传，平时 1 秒一次心跳，便于上位机判断设备在线。</li>
+  <li><strong>自定义 HID 下行</strong>：接收上位机的 RGB 命令，直接设置板载 RGB 三路亮度（0~100）。</li>
+</ul>
+
+<div class="note"><strong>V2.0 双模：</strong>同一套输入经主循环里的 <code>UsbHid_Task()</code> 与 <code>BT_Task()</code> 两条链路输出。USB 枚举完成时蓝牙只维持链路、不发输入报告，避免同一台电脑上出现双倍光标 / 重复按键；USB 未挂载时才由蓝牙发送键鼠报告。详见第 10 章。</div>
+
+<div class="note">主函数 <code>User/main.c</code> 运行 USB 键鼠 + 蓝牙键鼠两条链路；把 <code>ENABLE_BLUETOOTH</code> 改成 <code>0</code> 即可退回纯 USB 单模。USB 声卡、Codec / I²S、CDC 虚拟串口仍不参与启动。</div>
+
+<h2 id="s2">2 设计思路</h2>
+
+<h3>2.1 为什么用三个独立接口，而不是一个接口加 Report ID</h3>
+<p>键盘和鼠标也可以合并在一个 HID 接口里，用 Report ID 区分。但那样 BIOS、Windows 安装界面、PE 等只有简易 HID 驱动的环境往往只识别第一个 Report，兼容性差。拆成三个接口后，Windows 会把键盘、鼠标分别挂到系统自带驱动上，自定义接口单独留给上位机，行为最稳定，也正好对应考核「复合设备」的要求。</p>
+
+<h3>2.2 为什么键盘 / 鼠标声明 Boot 协议，自定义接口不声明</h3>
+<p>键盘接口 <code>SubClass=1, Protocol=1</code>、鼠标接口 <code>SubClass=1, Protocol=2</code>，即 USB HID 引导协议，无需完整 HID 报告解析即可使用。自定义接口填 <code>0/0</code>，系统只按报告描述符处理，不会把自定义数据误当成键盘输入。</p>
+
+<h3>2.3 报告描述符由模板宏生成，长度由编译期断言保证</h3>
+<p>键盘 65 字节、鼠标 77 字节、自定义 27 字节。配置描述符里的 <code>wDescriptorLength</code> 必须与数组实际长度一致，写错一个字节主机就会在枚举阶段拿到残缺报告。因此：</p>
+<pre>TU_VERIFY_STATIC(sizeof(desc_kbd)      == HID_DESC_LEN_KEYBOARD, "...");
+TU_VERIFY_STATIC(sizeof(desc_mouse)    == HID_DESC_LEN_MOUSE,    "...");
+TU_VERIFY_STATIC(sizeof(desc_custom)   == HID_DESC_LEN_CUSTOM,   "...");
+TU_VERIFY_STATIC(sizeof(desc_configuration) == CONFIG_TOTAL_LEN,  "...");   /* 91 字节 */</pre>
+<p>任何一处长度对不上，编译期就会报错，而不是等到插上 USB 才发现枚举失败。</p>
+
+<h3>2.4 STM32F103 的 PMA 预算</h3>
+<p>F103 的 USB 包存储区只有 512 字节，三个接口共四个端点，必须提前算清楚：</p>
+<table>
+<tr><th>用途</th><th>字节</th></tr>
+<tr><td>BTABLE（8 个端点偏移表）</td><td>64</td></tr>
+<tr><td>EP0 IN + OUT（控制传输，各 64）</td><td>128</td></tr>
+<tr><td>EP1 IN 键盘</td><td>64</td></tr>
+<tr><td>EP2 IN 鼠标</td><td>64</td></tr>
+<tr><td>EP3 IN + OUT 自定义 HID</td><td>128</td></tr>
+<tr><td><strong>合计</strong></td><td><strong>448 ≤ 512</strong>（余 64）</td></tr>
+</table>
+
+<h3>2.5 主循环绝不阻塞</h3>
+<p><code>tud_task()</code> 负责枚举、控制传输与端点事件，任何一次长时间阻塞都会让主机认为设备失联。因此所有延时都改成基于 TIM4 的 1ms 时基做「到点判断」，10ms 扫描一次输入，不做 <code>while</code> 死等。D+ 上拉也刻意延后：上电先把 PA12 输出低让主机看不到设备，等按键、摇杆、RGB、协议栈都初始化完，再切成复用功能，保证是一次干净的插入。</p>
+
+<h3>2.6 模块划分</h3>
+<table>
+<tr><th>文件</th><th>职责</th></tr>
+<tr><td><code>User/main.c</code></td><td>本项目唯一的启动入口，按顺序初始化并进入主循环</td></tr>
+<tr><td><code>hardware/TinyUSB/tusb_config.h</code></td><td>工程级配置：<code>CFG_TUD_HID=3</code>，关闭 AUDIO / CDC</td></tr>
+<tr><td><code>hardware/TinyUSB/usb_descriptors.h/.c</code></td><td>设备、配置、接口、端点、字符串描述符；接口与端点编号</td></tr>
+<tr><td><code>hardware/TinyUSB/usb_hid.h/.c</code></td><td>报告描述符、USB 中断与 1ms 时基、输入扫描与组包、HID 回调</td></tr>
+<tr><td><code>hardware/key.c/.h</code></td><td>8 按键 GPIO 读取与 10ms 消抖状态机（复用原有驱动）</td></tr>
+<tr><td><code>hardware/joystick.c/.h</code></td><td>双摇杆 ADC 采样与中点校准（复用原有驱动）</td></tr>
+<tr><td><code>hardware/tim2.c/.h</code></td><td>PC7/PC8/PC9 RGB 软件 PWM（复用原有驱动）</td></tr>
+</table>
+
+<h2 id="s3">3 原理框图</h2>
+
+<svg viewBox="0 0 920 430" xmlns="http://www.w3.org/2000/svg" font-family="Microsoft YaHei, sans-serif">
+  <defs>
+    <marker id="ar" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto">
+      <path d="M0,0 L9,4.5 L0,9 z" fill="#2f6fb5"/>
+    </marker>
+    <marker id="ar2" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto">
+      <path d="M0,0 L9,4.5 L0,9 z" fill="#b06a1c"/>
+    </marker>
+  </defs>
+
+  <text x="20" y="26" font-size="15" font-weight="bold" fill="#12335b">板载外设</text>
+  <text x="300" y="26" font-size="15" font-weight="bold" fill="#12335b">STM32F103RCT6（本项目固件）</text>
+  <text x="720" y="26" font-size="15" font-weight="bold" fill="#12335b">PC / Windows</text>
+
+  <!-- 左侧外设 -->
+  <rect x="20" y="45" width="180" height="62" rx="6" fill="#eef5fd" stroke="#2f6fb5"/>
+  <text x="34" y="70" font-size="14" fill="#1f2933">8 个板载按键</text>
+  <text x="34" y="92" font-size="12" fill="#5b6b7f">PC4/PC5, PB0/1/2/10/11/14</text>
+
+  <rect x="20" y="125" width="180" height="62" rx="6" fill="#eef5fd" stroke="#2f6fb5"/>
+  <text x="34" y="150" font-size="14" fill="#1f2933">双摇杆（4 路 ADC）</text>
+  <text x="34" y="172" font-size="12" fill="#5b6b7f">LX / LY / RX / RY</text>
+
+  <rect x="20" y="205" width="180" height="62" rx="6" fill="#fdf1e6" stroke="#b06a1c"/>
+  <text x="34" y="230" font-size="14" fill="#1f2933">RGB 指示灯</text>
+  <text x="34" y="252" font-size="12" fill="#5b6b7f">PC7 红 / PC8 绿 / PC9 蓝</text>
+
+  <rect x="20" y="300" width="180" height="58" rx="6" fill="#f4f6f9" stroke="#8494a8"/>
+  <text x="34" y="325" font-size="14" fill="#1f2933">USART1 调试日志</text>
+  <text x="34" y="346" font-size="12" fill="#5b6b7f">921600 8N1</text>
+
+  <!-- 中间 MCU -->
+  <rect x="250" y="42" width="410" height="330" rx="10" fill="#fbfdff" stroke="#12335b" stroke-width="2"/>
+  <rect x="268" y="60" width="374" height="60" rx="6" fill="#e8f0fb" stroke="#2f6fb5"/>
+  <text x="282" y="84" font-size="14" font-weight="bold" fill="#12335b">应用层：UsbHid_Task()</text>
+  <text x="282" y="106" font-size="12" fill="#1f2933">10ms 扫描 → 消抖 → 组键盘/鼠标/自定义报告 → 发送</text>
+
+  <rect x="268" y="135" width="374" height="76" rx="6" fill="#eef7ef" stroke="#3a7d52"/>
+  <text x="282" y="158" font-size="14" font-weight="bold" fill="#285c3b">TinyUSB HID Class（3 个实例）</text>
+  <text x="282" y="180" font-size="12" fill="#1f2933">ITF0 键盘 0x81 ｜ ITF1 鼠标 0x82 ｜ ITF2 自定义 0x83 / 0x03</text>
+  <text x="282" y="199" font-size="12" fill="#5b6b7f">报告描述符 65B / 77B / 27B</text>
+
+  <rect x="268" y="226" width="374" height="60" rx="6" fill="#f3eefb" stroke="#6a4ba3"/>
+  <text x="282" y="250" font-size="14" font-weight="bold" fill="#4b3677">TinyUSB Device Stack + DCD（fsdev）</text>
+  <text x="282" y="272" font-size="12" fill="#1f2933">枚举、控制传输、SET_REPORT 回调、端点收发</text>
+
+  <rect x="268" y="301" width="374" height="56" rx="6" fill="#f4f6f9" stroke="#8494a8"/>
+  <text x="282" y="325" font-size="14" font-weight="bold" fill="#3b4a5e">USB FS Device 硬件</text>
+  <text x="282" y="346" font-size="12" fill="#1f2933">PA11 DM / PA12 DP · 48MHz 时钟 · PMA 448/512B</text>
+
+  <!-- 右侧 PC -->
+  <rect x="710" y="45" width="190" height="62" rx="6" fill="#eef5fd" stroke="#2f6fb5"/>
+  <text x="724" y="70" font-size="14" fill="#1f2933">系统键盘驱动</text>
+  <text x="724" y="92" font-size="12" fill="#5b6b7f">Caps / Num Lock 状态回传</text>
+
+  <rect x="710" y="125" width="190" height="62" rx="6" fill="#eef5fd" stroke="#2f6fb5"/>
+  <text x="724" y="150" font-size="14" fill="#1f2933">系统鼠标驱动</text>
+  <text x="724" y="172" font-size="12" fill="#5b6b7f">光标 / 滚轮 / 左右键</text>
+
+  <rect x="710" y="205" width="190" height="62" rx="6" fill="#fdf1e6" stroke="#b06a1c"/>
+  <text x="724" y="230" font-size="14" fill="#1f2933">自定义 HID · 上位机</text>
+  <text x="724" y="252" font-size="12" fill="#5b6b7f">按键显示 / RGB 命令（待实现）</text>
+
+  <!-- 连线：输入 -->
+  <path d="M200,76 L248,76" stroke="#2f6fb5" stroke-width="2" marker-end="url(#ar)"/>
+  <path d="M200,156 L248,156" stroke="#2f6fb5" stroke-width="2" marker-end="url(#ar)"/>
+  <!-- 连线：输出 RGB -->
+  <path d="M248,236 L200,236" stroke="#b06a1c" stroke-width="2" marker-end="url(#ar2)"/>
+  <!-- USB -->
+  <path d="M660,180 L708,180" stroke="#2f6fb5" stroke-width="3" marker-end="url(#ar)"/>
+  <text x="662" y="170" font-size="12" fill="#12335b">USB 2.0 FS</text>
+  <path d="M710,156 L660,156" stroke="#2f6fb5" stroke-width="2" marker-end="url(#ar)"/>
+  <path d="M710,236 L660,236" stroke="#b06a1c" stroke-width="2" marker-end="url(#ar2)"/>
+  <text x="666" y="258" font-size="11" fill="#5b6b7f">IN 上行 / OUT 下行</text>
+
+  <text x="20" y="400" font-size="12" fill="#5b6b7f">蓝色箭头：设备 → 主机或输入方向；橙色箭头：主机 → 设备（LED / RGB 命令）。</text>
+</svg>
+<div class="cap">图 1　USB 键鼠复合设备原理框图</div>
+
+<h2 id="s4">4 软件流程图</h2>
+
+<svg viewBox="0 0 920 700" xmlns="http://www.w3.org/2000/svg" font-family="Microsoft YaHei, sans-serif">
+  <defs>
+    <marker id="fa" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto">
+      <path d="M0,0 L9,4.5 L0,9 z" fill="#2f6fb5"/>
+    </marker>
+    <marker id="fg" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto">
+      <path d="M0,0 L9,4.5 L0,9 z" fill="#3a7d52"/>
+    </marker>
+  </defs>
+
+  <text x="20" y="24" font-size="15" font-weight="bold" fill="#12335b">A. 上电初始化（main，只跑一次）</text>
+  <text x="520" y="24" font-size="15" font-weight="bold" fill="#12335b">B. 主循环（UsbHid_Task，反复执行）</text>
+
+  <g fill="#eef5fd" stroke="#2f6fb5">
+    <rect x="30" y="40" width="360" height="42" rx="6"/>
+    <rect x="30" y="100" width="360" height="42" rx="6"/>
+    <rect x="30" y="160" width="360" height="42" rx="6"/>
+    <rect x="30" y="220" width="360" height="42" rx="6"/>
+    <rect x="30" y="280" width="360" height="42" rx="6"/>
+    <rect x="30" y="340" width="360" height="42" rx="6"/>
+  </g>
+  <g font-size="13" fill="#1f2933">
+    <text x="44" y="66">上电复位</text>
+    <text x="44" y="126">UsbHid_PreInit()：PA12 输出低，主机看不到设备</text>
+    <text x="44" y="186">UART1 / TIM4 1ms 时基 / Key / Joystick / Tim2</text>
+    <text x="44" y="246">UsbHid_Init()：48MHz USB 时钟、PA11/12 复用、NVIC</text>
+    <text x="44" y="306">Key_FSM_Init() → tusb_init() 启动协议栈</text>
+    <text x="44" y="366">主机枚举：设备/配置/接口/HID/报告/字符串描述符</text>
+  </g>
+  <g stroke="#2f6fb5" stroke-width="2" marker-end="url(#fa)">
+    <path d="M210,82 L210,100"/><path d="M210,142 L210,160"/><path d="M210,202 L210,220"/>
+    <path d="M210,262 L210,280"/><path d="M210,322 L210,340"/>
+  </g>
+  <path d="M210,382 L210,412 L470,412" stroke="#2f6fb5" stroke-width="2" fill="none" marker-end="url(#fa)"/>
+
+  <!-- 右半：主循环 -->
+  <rect x="480" y="392" width="400" height="44" rx="6" fill="#e8f0fb" stroke="#12335b" stroke-width="2"/>
+  <text x="494" y="420" font-size="14" font-weight="bold" fill="#12335b">tud_task()：推进枚举与所有端点事件</text>
+
+  <rect x="480" y="455" width="400" height="46" rx="6" fill="#fff8ec" stroke="#b06a1c"/>
+  <text x="494" y="476" font-size="13" fill="#1f2933">判断：距上次扫描是否已满 10ms？</text>
+  <text x="494" y="494" font-size="12" fill="#8a6a34">未满 → 立即回到 tud_task()，不做任何阻塞</text>
+  <path d="M680,436 L680,455" stroke="#2f6fb5" stroke-width="2" marker-end="url(#fa)"/>
+
+  <rect x="480" y="520" width="400" height="44" rx="6" fill="#eef7ef" stroke="#3a7d52"/>
+  <text x="494" y="547" font-size="13" fill="#1f2933">Key_FSM_Update() 消抖 → 产生 PRESS / RELEASE 事件</text>
+  <path d="M680,501 L680,520" stroke="#3a7d52" stroke-width="2" marker-end="url(#fg)"/>
+
+  <g fill="#f7fbf8" stroke="#3a7d52">
+    <rect x="480" y="580" width="122" height="60" rx="6"/>
+    <rect x="615" y="580" width="122" height="60" rx="6"/>
+    <rect x="750" y="580" width="130" height="60" rx="6"/>
+  </g>
+  <g font-size="12" fill="#1f2933">
+    <text x="491" y="602">键盘扫描</text><text x="491" y="620">X / Y 点按</text><text x="491" y="636">补发释放报告</text>
+    <text x="626" y="602">鼠标扫描</text><text x="626" y="620">摇杆/按键/滚轮</text><text x="626" y="636">组 5 字节报告</text>
+    <text x="761" y="602">自定义扫描</text><text x="761" y="620">按键位图变化</text><text x="761" y="636">或 1s 心跳</text>
+  </g>
+  <g stroke="#3a7d52" stroke-width="2" marker-end="url(#fg)">
+    <path d="M540,564 L540,580"/><path d="M676,564 L676,580"/><path d="M815,564 L815,580"/>
+  </g>
+  <path d="M680,640 L680,668 L210,668 L210,414" stroke="#3a7d52" stroke-width="2" fill="none" marker-end="url(#fg)"/>
+  <text x="300" y="662" font-size="12" fill="#3a7d52">循环回到 tud_task()</text>
+
+  <!-- 下行事件 -->
+  <rect x="30" y="430" width="400" height="76" rx="6" fill="#fdf1e6" stroke="#b06a1c"/>
+  <text x="44" y="454" font-size="14" font-weight="bold" fill="#8a5a16">C. 主机下行（事件驱动，异步）</text>
+  <text x="44" y="476" font-size="12" fill="#1f2933">键盘 SET_REPORT(OUTPUT) → 解析 LED bit0/bit1 → 绿/红灯</text>
+  <text x="44" y="495" font-size="12" fill="#1f2933">自定义中断 OUT → 命令 0x01 + R/G/B → RGB 三路亮度</text>
+
+  <text x="30" y="540" font-size="12" fill="#5b6b7f">卸载 / 挂起：清空按键状态，避免恢复后误触发。</text>
+</svg>
+<div class="cap">图 2　软件流程图（初始化、主循环、主机下行回调）</div>
+
+<h2 id="s5">5 HID 接口与报告格式</h2>
+
+<table>
+<tr><th>接口</th><th>报告方向</th><th>长度</th><th>格式</th></tr>
+<tr><td>键盘 IN</td><td>设备 → 主机</td><td>8 字节</td><td><code>[修饰键][保留][6×键码]</code>，如 <code>00 00 39 00 00 00 00 00</code> = Caps Lock 按下</td></tr>
+<tr><td>键盘 OUT</td><td>主机 → 设备</td><td>1 字节</td><td>LED 位图：bit0 Num Lock、bit1 Caps Lock、bit2 Scroll Lock…（控制传输 SET_REPORT）</td></tr>
+<tr><td>鼠标 IN</td><td>设备 → 主机</td><td>5 字节</td><td><code>[按键位][X][Y][滚轮][横向滚轮]</code>，X/Y/滚轮均为 -127~127 相对值</td></tr>
+<tr><td>自定义 IN</td><td>设备 → 主机</td><td>8 字节</td><td><code>[按键位图][序号][0][0][0][0][0][0]</code></td></tr>
+<tr><td>自定义 OUT</td><td>主机 → 设备</td><td>8 字节</td><td><code>[命令][R][G][B][0][0][0][0]</code></td></tr>
+</table>
+
+<div class="note">
+<strong>无 Report ID。</strong>三个接口的报告描述符都没有声明 Report ID，第一个字节就是数据本身。上位机用 hidapi 读写时要注意：Windows 的 HID API 在「无 Report ID」设备上仍可能要求首字节补 <code>0x00</code>，读取时也可能带回一个前导 0。
+</div>
+
+<h3>配置描述符结构（共 91 字节）</h3>
+<pre>0x00  9  配置描述符（3 接口，总线供电，100mA）
+0x09  9  接口 0 HID 键盘（Boot，Protocol=1）
+0x12  9  HID 描述符（报告描述符 65 字节）
+0x1B  7  中断 IN 端点 0x81（64B，1ms）
+0x22  9  接口 1 HID 鼠标（Boot，Protocol=2）
+0x2B  9  HID 描述符（报告描述符 77 字节）
+0x34  7  中断 IN 端点 0x82
+0x3B  9  接口 2 HID 自定义（SubClass=0，Protocol=0）
+0x44  9  HID 描述符（报告描述符 27 字节）
+0x4D  7  中断 IN 端点 0x83
+0x54  7  中断 OUT 端点 0x03      ← 上位机写 RGB 命令必需
+     ----  91 字节</pre>
+
+<p>设备身份：<code>VID 0xCafe / PID 0x4004</code>。PID 从历史的 0x4002/0x4003 改为 0x4004，让 Windows 当作新设备重新枚举，避免沿用旧音频/CDC 设备的驱动绑定。</p>
+
+<h2 id="s6">6 键位映射</h2>
+
+<table>
+<tr><th>板载输入</th><th>引脚</th><th>标准设备功能</th><th>自定义 HID 位图</th></tr>
+<tr><td>A</td><td>PC4</td><td>鼠标左键</td><td>bit0</td></tr>
+<tr><td>B</td><td>PC5</td><td>鼠标右键</td><td>bit1</td></tr>
+<tr><td>X</td><td>PB0</td><td>Caps Lock（0x39）</td><td>bit2</td></tr>
+<tr><td>Y</td><td>PB1</td><td>Num Lock（0x53）</td><td>bit3</td></tr>
+<tr><td>UP</td><td>PB2</td><td>键盘空格 Space（键码 <code>0x2C</code>，短按一次出一个空格）</td><td>bit4</td></tr>
+<tr><td>DN</td><td>PB10</td><td>键盘回车 Enter（键码 <code>0x28</code>，短按一次换一行）</td><td>bit5</td></tr>
+<tr><td>LF</td><td>PB11</td><td>鼠标中键</td><td>bit6</td></tr>
+<tr><td>RG</td><td>PB14</td><td>（仅上报，不进标准键鼠）</td><td>bit7</td></tr>
+<tr><td>左摇杆</td><td>ADC</td><td>光标 X/Y 相对位移（旋转修正 + 平方速度曲线）</td><td>—</td></tr>
+<tr><td>右摇杆</td><td>ADC</td><td>滚轮（旋转后取「上」分量，阈值 ±12000，100ms 一格）</td><td>—</td></tr>
+</table>
+
+<div class="warn">
+<strong>方向与速度校准：</strong>板上两个摇杆是<strong>旋转 90° 安装</strong>的，物理「上」落在 X 通道。<code>joystick.c</code> 用 <code>JOY_ROTATE_90</code> 修正过，<code>usb_hid.c</code> 的 <code>joy_rotate()</code> 用 <code>USB_JOY_AXIS_ROTATE=1</code> 做同样修正；否则把 LX 当水平位移，推「上」就会变成光标左移。速度采用「死区 3000 + 平方曲线 + 每 10ms 上限 <code>USB_JOY_MOUSE_MAX=12</code> 像素」：中心附近只有 1~2 像素/报告，满偏约 1200 像素/秒（可继续调到 16）；旧版线性除以 480 相当于约 6800 像素/秒，几乎无法瞄准。实测某个方向相反，把 <code>USB_MOUSE_INVERT_X</code> / <code>USB_MOUSE_INVERT_Y</code> / <code>USB_WHEEL_INVERT</code> 改成 <code>1</code>；太快调小 <code>USB_JOY_MOUSE_MAX</code>，中心漂移调大 <code>USB_JOY_DEADZONE</code>；安装角度不同则依次试 <code>USB_JOY_AXIS_ROTATE</code> 的 <code>0 / 2 / 3</code>。
+</div>
+
+<h2 id="s7">7 自定义 HID 通信协议</h2>
+
+<p>厂商自定义 Usage Page <code>0xFF00</code>，输入 / 输出各 8 字节，无 Report ID。上位机应只打开 <strong>VID 0xCafe / PID 0x4004 的第三个 HID 接口</strong>，不要误开系统键盘或鼠标接口。</p>
+
+<h3>7.1 设备 → PC（输入报告）</h3>
+<pre>字节 0   按键位图：0 = 松开，1 = 按下（bit0=A … bit7=RG）
+字节 1   报告序号，每次上传 +1，便于上位机判断有没有丢包
+字节 2~7 保留，固定 0
+
+示例  05 1C 00 00 00 00 00 00
+      └─ bit0+bit2 = A 与 X 同时按下，序号 0x1C</pre>
+<p>触发条件：按键位图发生变化时立即上传；无变化时每 1000ms 上传一次心跳。</p>
+
+<h3>7.2 PC → 设备（输出报告）</h3>
+<pre>命令 0x01  SET_RGB：[0]=0x01 [1]=R [2]=G [3]=B [4..7]=0
+                     R/G/B 范围 0~100（超过会被限幅），直接驱动板载 RGB
+命令 0x02  GET_STATUS：协议预留，当前固件收到后只打印一行日志，不回数据
+
+示例  01 64 32 00 00 00 00 00   → 红 100%、绿 50%、蓝 0%（橙色）</pre>
+
+<div class="note">
+键盘 LED 状态与 RGB 命令共用同一组 PC7/PC8/PC9 引脚。当前策略是<strong>键盘锁定状态优先</strong>：收到 LED 输出报告时会按 Num/Caps Lock 状态重设绿灯和红灯（亮度 60），因此上位机设置的红/绿分量可能被覆盖。若后续需要两者完全独立，可在应用层增加「RGB 已被上位机接管」标志，让 LED 回调只改蓝灯或专用指示灯。
+</div>
+
+<h2 id="s8">8 编译、烧录与验证</h2>
+
+<h3>8.1 编译</h3>
+<pre>工程：D:\minzhan\stm32f103rct6工程模板\stm32f103rct6工程模板\Project.uvprojx
+命令行：D:\k5\UV4\UV4.exe -r Project.uvprojx -j0 -o build_dual.log
+结果：Code=56620  RO-data=5732  RW-data=56  ZI-data=11528
+      0 Error(s) / 490 Warning(s)
+      告警全部来自 TinyUSB 的 C11 / pedantic 提示，改动前后数量一致</pre>
+<p>RO-data 比纯 USB 版多约 4.5KB，是 RDA5876 的五张厂商补丁表；ZI-data 增加主要是蓝牙串口环形缓冲与 L2CAP 通道状态。工程分组中已移除 <code>usb_audio.c</code>、<code>usb_cdc.c</code>、<code>cdc_device.c</code>、<code>i2s.c</code>：USB 中断入口、TIM4 时基、D+ 预拉低这些职责已由 <code>usb_hid.c</code> 接管，保留旧文件会造成重复定义。<strong>蓝牙栈的 <code>BtApp</code> 文件组原本就在工程中</strong>，本次只是把它接上主循环并替换报告内容，<code>Project.uvprojx</code> 无需改动。</p>
+
+<h3>8.2 烧录与枚举验证（考核第 1 项，20 分）</h3>
+<ol>
+  <li>烧录 <code>Project.hex</code>（ST-Link 按 F8，或串口 ISP 后把 BOOT0 拨回 0）。</li>
+  <li>电脑设备管理器应出现：一个 HID 键盘、一个 HID 鼠标、一个「符合 HID 标准的设备」，<strong>不能出现「未知 USB 设备」</strong>。</li>
+  <li>串口助手开 <code>921600 8N1</code>，先开串口再按复位，应依次看到：<br>
+      <code>[bt] init=OK</code> → <code>[usb] enumeration released</code> → <code>[usb] mounted</code>。<br>
+      蓝牙初始化阻塞约 1.5s，这期间 D+ 一直拉低，主机只会看到一次干净的插入。</li>
+</ol>
+
+<h3>8.3 键鼠功能验证（考核第 2 项，30 分）</h3>
+<table>
+<tr><th>操作</th><th>预期现象</th></tr>
+<tr><td>拨左摇杆</td><td>上 / 下 / 左 / 右分别对应光标上 / 下 / 左 / 右，中心附近可精细定位，松手回中后立刻停下</td></tr>
+<tr><td>按 A / B / LF</td><td>鼠标左 / 右 / 中键点击</td></tr>
+<tr><td>拨右摇杆</td><td>页面滚动，速度约每秒 10 格（UP / DN 已不再控制滚轮）</td></tr>
+<tr><td>按 X</td><td>记事本大小写切换，板载<strong>红灯</strong>与电脑 Caps Lock 状态一致，日志 <code>[usb] kbd tap 0x39</code></td></tr>
+<tr><td>按 Y</td><td>数字键盘状态切换，板载<strong>绿灯</strong>同步，日志 <code>[usb] led num=.. caps=..</code></td></tr>
+<tr><td>短按 UP</td><td>记事本出现一个空格，日志 <code>[usb] kbd tap 0x2C</code></td></tr>
+<tr><td>短按 DN</td><td>记事本换一行，日志 <code>[usb] kbd tap 0x28</code></td></tr>
+</table>
+
+<h3>8.4 自定义 HID 通道验证（考核第 3 项的固件侧）</h3>
+<p>固件侧的双向通道已就绪：<code>tud_hid_get_report_cb()</code> 会返回最新按键位图，<code>tud_hid_set_report_cb()</code> 收到 <code>0x01</code> 命令会打印 <code>[usb] rgb set R=.. G=.. B=..</code> 并改变 RGB 灯。完整验收需要 PC 上位机配合，见下节。</p>
+
+<h2 id="s9">9 考核项对应与待办</h2>
+
+<table>
+<tr><th>考核项</th><th>分值</th><th>当前状态</th></tr>
+<tr><td>枚举键盘 / 鼠标 / 自定义 HID 复合设备</td><td>20</td><td>固件与描述符已完成，待上板枚举确认</td></tr>
+<tr><td>鼠标移动 / 滚轮 / 左右键，Caps/Num Lock 与指示灯（另加空格 / 回车键）</td><td>30</td><td>固件已完成，待上板功能确认</td></tr>
+<tr><td>PC 上位机与自定义 HID 双向交互（按键上传 + RGB 控制）</td><td>30</td><td><strong>固件通道已就绪；上位机按用户要求暂缓，本项暂未验收</strong></td></tr>
+<tr><td>文档（功能描述 + 设计思路 + 原理框图 + 软件流程图）</td><td>15</td><td>本文档</td></tr>
+<tr><td>源码（注释清晰、代码整洁）</td><td>5</td><td>按传输层 / 描述符层 / 应用层分层，关键处有设计说明与编译期断言</td></tr>
+</table>
+
+<div class="warn">
+<strong>待办：</strong>PC 上位机暂未实现（考核 30 分）。建议后续用 Python + <code>hidapi</code> + Tkinter，按 VID/PID 打开第三个 HID 接口，解析输入报告 byte0 的 8 个按键位并显示，提供 R/G/B 输入与「发送」按钮，附收发十六进制日志。协议已在第 7 节固定，不需要再改固件。另：蓝牙键鼠的 SDP / 报告描述符改动尚未上板验证，见第 10 章。
+</div>
+
+<h2 id="s10">10 双模扩展：蓝牙键鼠</h2>
+
+<h3>10.1 为什么能共存</h3>
+<p>两套协议栈占用的外设互不重叠，Flash 256KB / RAM 48KB 也放得下合并后的代码（Code≈55KB）。合并时真正要处理的只有三件事：TIM4 时基只能初始化一次（<code>hal_time_ms()</code> 由 <code>usb_hid.c</code> 提供，不能再编 <code>usb_audio.c</code>）；RGB 驱动在 <code>tim2.c</code> / <code>tim3.c</code> 中二选一（本工程用 tim2 软件 PWM）；蓝牙初始化阻塞期间必须让 USB 保持在「未插入」状态。</p>
+
+<table>
+<tr><th>资源</th><th>USB 链路</th><th>蓝牙链路</th><th>结论</th></tr>
+<tr><td>引脚</td><td>PA11 / PA12（USB DP/DM）</td><td>PA2 / PA3（USART2）、PA8（TIM1 32.768kHz）、PC12（复位 / LDO）</td><td>无重叠</td></tr>
+<tr><td>定时器</td><td>TIM4 1ms 时基、TIM2 软件 PWM</td><td>TIM1 输出参考时钟</td><td>共用 TIM4，其余独立</td></tr>
+<tr><td>中断</td><td>USB LP/HP（优先级 2）、TIM4（3）</td><td>USART2 中断接收，1024B 环形缓冲</td><td>主循环不阻塞即可</td></tr>
+<tr><td>Flash</td><td>代码区</td><td>末页 <code>0x0803F800</code> 存 Link Key</td><td>约 55KB，离末页很远</td></tr>
+<tr><td>共用输入</td><td colspan="2">8 按键 EXTI、双摇杆 ADC PA4~PA7、USART1 921600 日志、<code>hal_time_ms()</code></td><td>同一套驱动</td></tr>
+</table>
+
+<h3>10.2 蓝牙 HID 设备形态</h3>
+<p>原蓝牙工程是游戏手柄（SDP 642 字节 / 手柄描述符 306 字节）。改成键鼠时<strong>只替换 SDP 里的 HIDReportDescriptor</strong>，其余属性、PnP 记录、两条 ProtocolDescriptorList 骨架一个字节没动——历史上整条重写 SDP 记录（481 / 513 字节变体）都导致 Windows 连不上，保留已验证的框架风险最小。</p>
+<pre>SDP AttributeList : 642 -> 455 字节
+HIDReportDescriptor: 306 -> 119 字节 = 键盘 65B + 鼠标 54B
+HIDDeviceSubclass : 0x40 (Keyboard) -> 0xC0 (Combo keyboard/pointing)
+设备名 / CoD      : STM32 BT KeyMouse / 0x0005C0
+
+长度对账（L = 描述符长度）：
+  0x26 文本串      = L
+  内层 0x36 序列   = 5 + L
+  外层 0x36 序列   = 8 + L
+  记录2 0x36 序列  = 207 + L
+  数组总长         = 336 + L      （L = 119 -> 455）
+
+V2.1 追加的等长替换（不动任何长度字段）：
+  ServiceName   : "Xbox Bluetooth Gamepad" -> "STM32 HID KeyMouse Dev"（同为 22 字节）
+  PnP VendorID  : 0x045E (Microsoft) -> 0x1234
+  PnP ProductID : 0x02E0 (Xbox 手柄) -> 0x4004（与 USB 侧一致）</pre>
+<p>后两项很关键：原 SDP 记录抄自 Xbox 手柄抓包，Windows 看到 <code>0x045E/0x02E0</code> 加上服务名里带「Gamepad」会沿用缓存的<strong>游戏控制器驱动</strong>，即使描述符已换成键盘/鼠标也不会加载键鼠驱动。等长替换既不破坏长度字段，也能让主机重新做一次驱动匹配。</p>
+
+<h3>10.3 报告格式</h3>
+<p>两个 Application Collection 靠 Report ID 区分，HIDP 输入报告统一是 <code>0xA1 + ID + 数据</code>：</p>
+<pre>ID 1 键盘（10 字节）：A1 01 [修饰键][保留][6 键码]
+ID 2 鼠标（ 6 字节）：A1 02 [按键位][X][Y][滚轮]</pre>
+<p>设备每 20ms 采样一次：键盘只在按键位图变化时发（松手发全 0 报告释放），鼠标在位移 / 滚轮非零或按键变化时发。摇杆换算沿用 USB 侧的「90° 旋转 + 死区 3000 + 平方曲线 + 上限 12」，<code>USB_JOY_*</code> 与 <code>BT_JOY_*</code> 两套宏要同步修改。<code>SET_REPORT</code>（键盘 LED）目前只回成功、不解析，所以纯蓝牙模式下指示灯不跟随锁定状态；<code>GET_REPORT</code> 由原来的 NAK 改为回一份空 DATA 报告，更贴合蓝牙键盘驱动。</p>
+<p><strong>V2.1 HIDP 协议修正：</strong><code>hidp_control_rsp()</code> 原先在 <code>GET_PROTOCOL</code> 回 <code>0xA1</code>，而 HIDP DATA 头低 4 位里 <code>1 = Boot 协议、0 = Report 协议</code>，等于告诉主机「按 boot 格式解析」。主机会把报告里的 Report ID <code>0x01</code> 当成修饰键 / 按键位，键鼠全部错乱——正是「连得上但用不了」。现在改为如实回报当前协议，<code>GET_IDLE</code> 也补上了规范要求的数据字节。</p>
+
+<p><strong>V2.2 双协议支持（关键修复）：</strong>上一版收到 <code>SET_PROTOCOL(Boot)</code> 时回 <code>0x04 ERR_UNSUPPORTED_REQ</code> 拒绝，这是错的。Windows 的蓝牙键盘驱动 <code>hidbth</code> 为了让键盘在 BIOS / 登录界面可用，<strong>几乎一定会把设备切到 Boot 协议</strong>；被拒绝后部分版本会判定「设备不符合 HID 规范」，干脆不加载键鼠驱动——于是蓝牙连得上、设备列表里也有，但按键和摇杆完全没反应。现在改为记录 <code>g_bt_hid_protocol</code> 并按协议换报告格式：</p>
+<pre>Report 协议（proto=0）  键盘 A1 01 + 8B（10 字节）   鼠标 A1 02 + 4B（6 字节）
+Boot   协议（proto=1）  键盘 A1    + 8B（ 9 字节）   鼠标 A1    + 3B（4 字节，无滚轮）</pre>
+<p>另外在 HID Interrupt 通道刚建立时<strong>主动补发一帧「全松开、无位移」报告</strong>：部分 Windows 版本要收到第一帧输入报告才会把这个蓝牙 HID 设备真正注册进键鼠堆栈，在那之前按键没有任何反应。串口会看到 <code>[hid] SET_PROTOCOL -&gt; Boot</code>，这是正常且必须的。</p>
+
+<h3>10.4 自动选路</h3>
+<div class="note">
+<code>BT_Task()</code> 发报告前调用 <code>UsbHid_IsMounted()</code>（内部即 <code>tud_mounted()</code>）。<strong>USB 已挂载</strong>：输入只走 USB，蓝牙链路照常保持、照常跑 L2CAP/SDP，但不发输入报告；<strong>USB 未挂载</strong>：输入走蓝牙键鼠。串口在切换时打印 <code>[mux] input -&gt; USB / BLUETOOTH</code>。这样两条链路同时连同一台电脑时不会出现双倍光标或重复按键。
+</div>
+<div class="warn">
+<strong>供电约束：</strong>若板子只靠这根 USB 线供电，拔线会同时断电，蓝牙链路也就不存在了。要验证「纯蓝牙」必须给板子独立供电（ST-Link、外部 5V 或电池）。
+</div>
+
+<h3>10.5 上板验证要点与已知风险</h3>
+<div class="warn">
+<strong>本章改动只做了完整编译验证（0 Error），尚未上板抓包验证。</strong>若配对后显示「无可用服务」或只认出键盘 / 鼠标之一，按此顺序排查：① SDP 四个长度字段与数组总长是否一致；② <code>HIDDeviceSubclass=0xC0</code> 是否被驱动接受；③ <code>hidp_control_rsp()</code> 的 <code>GET_REPORT</code> 应答格式；④ 设备管理器里的蓝牙设备类别（CoD）。V2.1 修正了 HIDP 协议应答与 SDP 设备标识，V2.2 补上 Boot 协议支持与首帧报告，具体排查顺序见 10.6；回退方式见 <code>Docs/README.md</code> 第 11 节。
+</div>
+<table>
+<tr><th>检查项</th><th>预期</th></tr>
+<tr><td>插着 USB 时</td><td><code>[mux] input -&gt; USB (BT reports held)</code>，蓝牙虽已配对但不产生第二份输入<br>V2.2 起 <code>BT_FORCE_REPORT=1</code>（排查状态），会打印 <code>[mux] BT FORCED ... double input</code>，双份输入属正常，确认可用后改回 <code>0</code></td></tr>
+<tr><td>独立供电、不插 USB</td><td><code>[mux] input -&gt; BLUETOOTH</code>，键鼠报告由蓝牙链路发出</td></tr>
+<tr><td>Windows 蓝牙设置</td><td>能搜到 <code>STM32 BT KeyMouse</code>，配对后出现蓝牙键盘 + 蓝牙鼠标（不是游戏手柄）</td></tr>
+<tr><td>断电再上电</td><td>用 Flash 里保存的 Link Key 自动回连</td></tr>
+</table>
+
+<h3>10.6 「电脑能连上蓝牙，但键鼠没反应」排查清单</h3>
+<ol>
+  <li><strong>先删掉 Windows 里的旧配对（最常见）。</strong>这台电脑之前配对过蓝牙游戏手柄，BD_ADDR 没变，Windows 会沿用缓存的设备类型与驱动。设置 → 蓝牙和其他设备 →「移除设备」；板子上电时<strong>按住 A 键</strong>清掉 Flash 绑定（串口打印 <code>[bond] CLEARED</code>）；重新搜索配对。</li>
+  <li><strong>确认 USB 数据线没插在电脑上。</strong>只要 USB 枚举成功，自动选路就<strong>故意不发蓝牙报告</strong>。验证纯蓝牙要用「只供电、不接 D+/D−」的线（贴住 A 口中间两触点，或买充电专用线）接电脑 / 充电头。V2.2 起 <code>BT_FORCE_REPORT</code> 默认已设为 <code>1</code>（强制发），这一条暂时不挡人；蓝牙确认可用后要改回 <code>0</code>，否则同一台电脑会双倍输入。</li>
+  <li><strong>读状态行。</strong>V2.2 起每 2 秒打印一次，字段变多了：<code>[bt] st=3 ch=111 usb=0 proto=1 rpt=128 t=15320 drop=0</code>。<code>st</code> 0=初始化 1=可发现 2=已连接 3=HID 就绪；<code>ch</code> 依次是 SDP / HID-Control / HID-Interrupt；<code>usb</code> 主机是否枚举成功；<code>proto</code> 0=Report、1=Boot；<code>rpt</code> 已发报告数；<code>t</code> 连接时长；<code>drop</code> 串口丢字节。<br>
+  <code>rpt</code> 一直不涨 = 报告没发出去；<code>ch=110</code> = HID Interrupt 没开，主机没认出 HID 设备；<code>ch=100</code> = 只开了 SDP；<code>ch=000</code> = 主机没来开通道；反复出现 <code>[bt] init=OK</code> 从头开始 = 板子被断电重启。</li>
+  <li><strong>看设备管理器。</strong>应出现「蓝牙 HID 键盘设备」与「HID 鼠标」，不能是游戏控制器或带黄色感叹号；V2.1 已把服务名和 PnP VID/PID 从 Xbox 手柄改成中性标识，就是为了触发重新匹配。</li>
+  <li><strong>看 HIDP 日志。</strong>出现 <code>[hid] SET_PROTOCOL -&gt; Boot</code> 是<strong>正常且必须的</strong>：主机切到 Boot 协议后，固件会自动改发「无 Report ID」的 9 字节键盘 / 4 字节鼠标报告。没有这行说明主机停在 Report 协议，同样可用。若 <code>[hid]</code> 一条都没有，说明主机还没打开 HID Control 通道。</li>
+  <li><strong>排除供电干扰。</strong>充电宝轻载自动关机（板子 5V 侧仅 30~60mA，低于常见 50~80mA 阈值）会让板子每隔几秒断电重启，串口反复从头打印启动信息，看起来像「连上一会儿就掉」。改用电脑 USB 口 / 5V 充电头配充电专用线，或让充电宝进小电流模式、并 47Ω/1W 假负载。</li>
+</ol>
+<div class="note">本节依据的是静态代码审查与编译验证，尚未上板抓包。若按清单走完仍不生效，请把开机到配对完成的完整串口日志（921600 8N1）发回，重点看 <code>[sdp]</code>、<code>[l2]</code>、<code>[hid] CTRL</code> 三类行。</div>
+
+</body>
+</html>

@@ -1,0 +1,31 @@
+# Keil build output
+**/Objects/
+**/Listings/
+*.o
+*.d
+*.axf
+*.lnp
+*.dep
+*.map
+*.build_log.htm
+
+# Local IDE / machine settings
+*.uvguix.*
+*.uvgui.*
+*.scvd
+*.iex
+.vs/
+.vscode/
+.idea/
+
+# Logs, backups and OS files
+*.log
+*.tmp
+*.bak
+diag.txt
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Large optional offline speech model
+ggml-base.bin
