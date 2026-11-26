@@ -54,7 +54,10 @@ static uint8_t  s_byUs       = 0u;      /* 本次连接是不是我们主动回�
 #define BT_REPORT_KEYBOARD  0x01u
 #define BT_REPORT_MOUSE     0x02u
 #define BT_REPORT_CUSTOM    0x03u
-#define BT_CUSTOM_REPORT_LEN 8u
+#define BT_CUSTOM_REPORT_LEN 9u    /* rep[8]：L3=左 Shift，R3=左 Ctrl */
+
+#define HID_MODIFIER_LEFT_CTRL   0x01u
+#define HID_MODIFIER_LEFT_SHIFT  0x02u
 
 static void bt_reset_report_state(void);
 
@@ -293,12 +296,14 @@ void bt_app_on_encrypted(void)
 #define BT_MOUSE_FILTER_SAMPLES 8u
 
 static uint8_t  s_keyBm = 0u;
+static uint8_t  s_keyModifier = 0u;
 static uint8_t  s_mouseBtn = 0u;
 static uint32_t s_wheelMs = 0u;
 static uint8_t  s_routeUsb = 0xFFu;
 static uint8_t  s_protoDirty = 1u;
 static uint8_t  s_btActive = 0u;
 static uint8_t  s_customBm = 0u;
+static uint8_t  s_customJoy = 0u;
 static uint8_t  s_customLed = 0xFFu;
 static uint8_t  s_customSeq = 0u;
 static uint32_t s_customBeat = 0u;
@@ -371,7 +376,7 @@ static uint8_t bt_read_key_bitmap(void)
     return bm;
 }
 
-static void bt_send_keyboard_report(uint8_t bm)
+static void bt_send_keyboard_report(uint8_t bm, uint8_t modifier)
 {
     s_lastTx = hal_time_ms();
     uint8_t rpt[10];
@@ -389,6 +394,7 @@ static void bt_send_keyboard_report(uint8_t bm)
         rpt[1] = BT_REPORT_KEYBOARD;
         base = 2u;
     }
+    rpt[base] = modifier;           /* L3=Left Shift，R3=Left Ctrl，可叠加 */
     if ((bm & 0x04u) != 0u) { rpt[base + 2u + n++] = 0x39u; }
     if ((bm & 0x08u) != 0u) { rpt[base + 2u + n++] = 0x53u; }
     if ((bm & 0x10u) != 0u) { rpt[base + 2u + n++] = 0x2Cu; }
@@ -412,10 +418,10 @@ static void bt_send_mouse_report(uint8_t buttons, int8_t dx, int8_t dy, int8_t w
     }
 }
 
-static void bt_send_custom_report(uint8_t bm, uint8_t led)
+static void bt_send_custom_report(uint8_t bm, uint8_t led, uint8_t joy)
 {
     s_lastTx = hal_time_ms();
-    uint8_t rpt[10];
+    uint8_t rpt[11];
 
     if (g_bt_hid_protocol != HIDP_PROTOCOL_REPORT)
     {
@@ -428,15 +434,18 @@ static void bt_send_custom_report(uint8_t bm, uint8_t led)
     rpt[3] = s_customSeq;
     rpt[4] = led;
     rpt[5] = bt_status_byte();      /* rep[3]：工作模式 + 链路状态，供上位机显示 */
-    bt_hid_send_report(rpt, 10u);
+    rpt[10] = joy;                  /* rep[8]：bit0=L3/Shift，bit1=R3/Ctrl */
+    bt_hid_send_report(rpt, 11u);   /* 0xA1 + Report ID 3 + 9 字节报告体 */
     s_customSeq++;
 }
 
 static void bt_reset_report_state(void)
 {
     s_keyBm = 0u;
+    s_keyModifier = 0u;
     s_mouseBtn = 0u;
     s_customBm = 0u;
+    s_customJoy = 0u;
     s_customLed = 0xFFu;
     s_customBeat = 0u;
     s_btActive = 0u;
@@ -448,9 +457,9 @@ static void bt_release_inputs(void)
 {
     if (s_btActive != 0u)
     {
-        bt_send_keyboard_report(0u);
+        bt_send_keyboard_report(0u, 0u);
         bt_send_mouse_report(0u, 0, 0, 0);
-        bt_send_custom_report(0u, UsbHid_GetKeyboardLeds());
+        bt_send_custom_report(0u, UsbHid_GetKeyboardLeds(), 0u);
     }
     bt_reset_report_state();
 }
@@ -622,6 +631,8 @@ void bt_app_on_protocol_changed(void)
 static void bt_input_scan_and_send(uint32_t now)
 {
     uint8_t bm = bt_read_key_bitmap();
+    uint8_t modifier = 0u;
+    uint8_t joy = 0u;
     uint8_t buttons = 0u;
     uint8_t led = UsbHid_GetKeyboardLeds();
     int32_t lx, ly, mx, my;
@@ -630,11 +641,23 @@ static void bt_input_scan_and_send(uint32_t now)
     int8_t dy;
     int8_t wheel = 0;
 
+    if (Joystick_KeyIsDown(JOYSTICK_L3) != 0u)
+    {
+        joy |= 0x01u;
+        modifier |= HID_MODIFIER_LEFT_SHIFT;
+    }
+    if (Joystick_KeyIsDown(JOYSTICK_R3) != 0u)
+    {
+        joy |= 0x02u;
+        modifier |= HID_MODIFIER_LEFT_CTRL;
+    }
+
     s_btActive = 1u;
-    if ((bm != s_keyBm) || (s_protoDirty != 0u))
+    if ((bm != s_keyBm) || (modifier != s_keyModifier) || (s_protoDirty != 0u))
     {
         s_keyBm = bm;
-        bt_send_keyboard_report(bm);
+        s_keyModifier = modifier;
+        bt_send_keyboard_report(bm, modifier);
     }
 
     if ((bm & 0x01u) != 0u) { buttons |= 0x01u; }
@@ -672,11 +695,12 @@ static void bt_input_scan_and_send(uint32_t now)
      *   没人读的时候，Windows 的 HID 类驱动会把这些输入报告堆在队列里，
      *   堆满之后整台 HID 设备被判失败，BTHID 直接把蓝牙链路拆掉 ——
      *   断开原因正是 0x13（对端主动终止），周期正好是队列堆满的时间。 */
-    if ((bm != s_customBm) || (led != s_customLed) ||
+    if ((bm != s_customBm) || (joy != s_customJoy) || (led != s_customLed) ||
         (bt_status_byte() != s_customStatus) || (s_protoDirty != 0u))
     {
-        bt_send_custom_report(bm, led);
+        bt_send_custom_report(bm, led, joy);
         s_customBm = bm;
+        s_customJoy = joy;
         s_customLed = led;
         s_customStatus = bt_status_byte();
     }
@@ -685,7 +709,7 @@ static void bt_input_scan_and_send(uint32_t now)
      * 使用 Windows 始终读取的键盘集合，不用无人读取时会堆积的自定义集合。 */
     if ((uint32_t)(now - s_lastTx) >= REPORT_MS)
     {
-        bt_send_keyboard_report(s_keyBm);
+        bt_send_keyboard_report(s_keyBm, s_keyModifier);
     }
 
     s_protoDirty = 0u;
@@ -883,9 +907,9 @@ void BT_Task(void)
                 /* 通道刚就绪：先发一帧"全部松开"，清掉主机侧可能残留的
                  * 按键/按钮状态（上一轮断开时如果按键正按着，主机可能
                  * 一直认为它还按着，表现为"按键后键鼠都不正常"）。 */
-                bt_send_keyboard_report(0u);
+                bt_send_keyboard_report(0u, 0u);
                 bt_send_mouse_report(0u, 0, 0, 0);
-                bt_send_custom_report(0u, UsbHid_GetKeyboardLeds());
+                bt_send_custom_report(0u, UsbHid_GetKeyboardLeds(), 0u);
 
                 /* 独立供电时 s_btEff 在蓝牙连接前就已经是 1，模式切换处的
                  * 校准会早于射频链路建立。HID 通道就绪后再校准一次，才能消除
@@ -912,7 +936,7 @@ void BT_Task(void)
                  * 否则上位机未打开自定义集合时可能在主机侧堆积输入报告。 */
                 if ((uint32_t)(now - s_lastTx) >= REPORT_MS)
                 {
-                    bt_send_keyboard_report(0u);
+                    bt_send_keyboard_report(0u, 0u);
                 }
             }
             else

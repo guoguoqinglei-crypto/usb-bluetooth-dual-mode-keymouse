@@ -28,10 +28,10 @@ static const uint8_t desc_custom[] =
     0x26, 0xFF, 0x00,
     0x75, 0x08,
     0x09, 0x01,
-    0x95, 0x08,
+    0x95, 0x09,                 /* 输入 9B：新增 rep[8] = L3/R3 状态 */
     0x81, 0x02,
     0x09, 0x02,
-    0x95, 0x08,
+    0x95, 0x08,                 /* 输出仍 8B，保持 RGB 命令协议兼容 */
     0x91, 0x02,
     0xC0
 };
@@ -454,8 +454,9 @@ void UsbHid_Init(void)
     NVIC_SetPriority(USB_LP_CAN1_RX0_IRQn, 2);
     NVIC_SetPriority(USB_HP_CAN1_TX_IRQn, 2);
 
-    /* 第 4 步：按键状态机初始化（键盘 X/Y 用它的消抖事件） */
+    /* 第 4 步：初始化板载按键与两个摇杆按键的独立状态机 */
     Key_FSM_Init();
+    Joystick_KeyInit();
 
     /* 第 5 步：从 Flash 读回上次保存的工作模式（首次上电没有记录按"自动"处理） */
     s_btPref = mode_flash_load();
@@ -520,11 +521,13 @@ static void led_reapply_lock_indicators(void)
 
 /* 自定义 HID 上行状态 */
 static uint8_t  s_key_bitmap   = 0U;
+static uint8_t  s_stick_bitmap = 0U;  /* bit0=L3/左 Shift，bit1=R3/左 Ctrl */
 static uint8_t  s_led_reported = 0xFFU;  /* 上次已上报的锁定状态，初值取不可能值，强制上电先发一帧 */
 static uint8_t  s_seq          = 0U;
 static uint32_t s_last_beat_ms = 0U;
 
 static uint8_t  s_kbd_hold       = 0U;
+static uint8_t  s_kbd_modifier   = 0U;  /* 独立修饰键，可与普通键码同时上报 */
 static uint8_t  s_kbd_raw        = 0U;
 static uint8_t  s_kbd_stable     = 0U;
 static uint8_t  s_kbd_dirty      = 1U;  /* 端点忙时保留待发状态，不能直接丢掉 */
@@ -630,7 +633,8 @@ static int8_t axis_to_move(int32_t v)
 
 static void kbd_reset_state(void)
 {
-    s_kbd_hold   = 0U;
+    s_kbd_hold     = 0U;
+    s_kbd_modifier = 0U;
     s_kbd_raw    = 0U;
     s_kbd_stable = 0U;
     s_kbd_dirty  = 1U;
@@ -667,7 +671,7 @@ static void kbd_flush(void)
         return;
     }
 
-    if (tud_hid_n_keyboard_report(USB_HID_INST_KEYBOARD, 0U, 0U, keys))
+    if (tud_hid_n_keyboard_report(USB_HID_INST_KEYBOARD, 0U, s_kbd_modifier, keys))
     {
         s_kbd_dirty = 0U;
         for (i = 0U; i < USB_LOCK_KEY_COUNT; i++)
@@ -689,7 +693,26 @@ static void kbd_flush(void)
 static void kbd_scan(void)
 {
     uint8_t want = 0U;
+    uint8_t modifier = 0U;
     uint8_t i;
+
+    /* L3/R3 已由各自的独立状态机完成 20ms 消抖；这里只组合 HID 修饰键位。
+     * 两键可叠加，且不影响 UP/DN/X/Y 的普通键码。 */
+    if (Joystick_KeyIsDown(JOYSTICK_L3) != 0U)
+    {
+        modifier |= 0x02U;          /* HID Modifier: Left Shift */
+    }
+    if (Joystick_KeyIsDown(JOYSTICK_R3) != 0U)
+    {
+        modifier |= 0x01U;          /* HID Modifier: Left Ctrl */
+    }
+    if (modifier != s_kbd_modifier)
+    {
+        s_kbd_modifier = modifier;
+        s_kbd_dirty = 1U;
+        UART1_Printf("[usb] modifier 0x%02X (L3=Shift, R3=Ctrl)\r\n",
+                     (unsigned)modifier);
+    }
 
     /* --- UP / DN：先采样，再 20ms 消抖 --- */
     if (Key_IsDown(KEY_UP) != 0u)
@@ -889,6 +912,7 @@ static void rainbow_task(void)
 static void custom_scan(void)
 {
     uint8_t  bm = 0U;
+    uint8_t  joy = 0U;
     uint8_t  led;
     uint8_t  rep[USB_HID_CUSTOM_REPORT_LEN];
     uint8_t  k;
@@ -903,14 +927,17 @@ static void custom_scan(void)
         }
     }
 
+    if (Joystick_KeyIsDown(JOYSTICK_L3) != 0U) { joy |= 0x01U; }
+    if (Joystick_KeyIsDown(JOYSTICK_R3) != 0U) { joy |= 0x02U; }
+
     /* 第 3 字节回传锁定状态：bit0 NumLock、bit1 CapsLock。 */
     led = UsbHid_GetKeyboardLeds();
 
     st = custom_status_byte();
 
     /* 诊断字段也纳入变化检测：断开/回连时上位机能马上看到 */
-    changed = ((bm != s_key_bitmap) || (led != s_led_reported) ||
-               (st != s_status_reported) ||
+    changed = ((bm != s_key_bitmap) || (joy != s_stick_bitmap) ||
+               (led != s_led_reported) || (st != s_status_reported) ||
                (g_bt_last_disc_reason != s_diag_reason) ||
                (BT_AppReconnectTries() != s_diag_tries) ||
                (BT_AppState() != s_diag_state) ||
@@ -936,10 +963,12 @@ static void custom_scan(void)
     rep[5] = BT_AppReconnectTries();/* 诊断：回连尝试次数 */
     rep[6] = BT_AppState();         /* 诊断：蓝牙状态机状态（0~3） */
     rep[7] = bt_hid_chan_state();   /* 诊断：HID 通道状态（bit0控制 bit1中断 bit2可发） */
+    rep[8] = joy;                   /* 新增：bit0=L3/Shift，bit1=R3/Ctrl */
 
     if (tud_hid_n_report(USB_HID_INST_CUSTOM, 0U, rep, (uint16_t)sizeof(rep)))
     {
         s_key_bitmap   = bm;
+        s_stick_bitmap = joy;
         s_led_reported = led;
         s_status_reported = st;
         s_diag_reason = g_bt_last_disc_reason;
@@ -963,6 +992,7 @@ void UsbHid_Task(void)
     }
     s_last_scan_ms = now;
     Key_FSM_Update();
+    Joystick_KeyUpdate();           /* 全工程唯一更新点，USB/BT 共用消抖结果 */
 
     /* 上电 5 秒后解除"不闪灯"限制 */
     if ((s_flashGrace != 0U) && (s_millis >= MODE_FLASH_GRACE_MS))
@@ -1028,6 +1058,12 @@ uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id,
         buffer[0] = s_key_bitmap;
         buffer[1] = s_seq;
         buffer[2] = UsbHid_GetKeyboardLeds();
+        buffer[3] = custom_status_byte();
+        buffer[4] = g_bt_last_disc_reason;
+        buffer[5] = BT_AppReconnectTries();
+        buffer[6] = BT_AppState();
+        buffer[7] = bt_hid_chan_state();
+        buffer[8] = s_stick_bitmap;
         return USB_HID_CUSTOM_REPORT_LEN;
     }
 

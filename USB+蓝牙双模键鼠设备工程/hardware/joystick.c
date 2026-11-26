@@ -521,3 +521,106 @@ uint8_t Joystick_GetKeyState(uint8_t key)
             return 1;
     }
 }
+
+/* ============================================================================
+ * L3 / R3 独立按键状态机
+ * ----------------------------------------------------------------------------
+ * IDLE -> PRESS_DEBOUNCE -> PRESSED -> RELEASE_DEBOUNCE -> IDLE
+ * 每个状态只属于一个摇杆按键，两个按键可同时按下、互不清除对方状态。
+ * 10ms 扫描一次，连续 2 个周期电平一致才确认边沿，即 20ms 消抖。
+ * ========================================================================== */
+#define JOYKEY_STATE_IDLE              0U
+#define JOYKEY_STATE_PRESS_DEBOUNCE    1U
+#define JOYKEY_STATE_PRESSED           2U
+#define JOYKEY_STATE_RELEASE_DEBOUNCE  3U
+#define JOYKEY_DEBOUNCE_COUNT          2U
+#define JOYKEY_COUNT                   2U
+
+typedef struct
+{
+    uint8_t state;
+    uint8_t count;
+} Joystick_KeyFsm;
+
+static Joystick_KeyFsm s_joyKeyFsm[JOYKEY_COUNT];
+
+void Joystick_KeyInit(void)
+{
+    uint8_t key;
+
+    for (key = 0U; key < JOYKEY_COUNT; key++)
+    {
+        s_joyKeyFsm[key].state = JOYKEY_STATE_IDLE;
+        s_joyKeyFsm[key].count = 0U;
+    }
+}
+
+void Joystick_KeyUpdate(void)
+{
+    uint8_t key;
+
+    for (key = 0U; key < JOYKEY_COUNT; key++)
+    {
+        const uint8_t pressed = (Joystick_GetKeyState(key) == 0U) ? 1U : 0U;
+        Joystick_KeyFsm *fsm = &s_joyKeyFsm[key];
+
+        switch (fsm->state)
+        {
+            case JOYKEY_STATE_IDLE:
+                if (pressed != 0U)
+                {
+                    fsm->state = JOYKEY_STATE_PRESS_DEBOUNCE;
+                    fsm->count = 0U;
+                }
+                break;
+
+            case JOYKEY_STATE_PRESS_DEBOUNCE:
+                if (pressed == 0U)
+                {
+                    fsm->state = JOYKEY_STATE_IDLE;  /* 抖动，不产生按下 */
+                }
+                else if (++fsm->count >= JOYKEY_DEBOUNCE_COUNT)
+                {
+                    fsm->state = JOYKEY_STATE_PRESSED;
+                    fsm->count = 0U;
+                }
+                break;
+
+            case JOYKEY_STATE_PRESSED:
+                if (pressed == 0U)
+                {
+                    fsm->state = JOYKEY_STATE_RELEASE_DEBOUNCE;
+                    fsm->count = 0U;
+                }
+                break;
+
+            case JOYKEY_STATE_RELEASE_DEBOUNCE:
+                if (pressed != 0U)
+                {
+                    fsm->state = JOYKEY_STATE_PRESSED; /* 释放抖动，仍保持按下 */
+                }
+                else if (++fsm->count >= JOYKEY_DEBOUNCE_COUNT)
+                {
+                    fsm->state = JOYKEY_STATE_IDLE;
+                    fsm->count = 0U;
+                }
+                break;
+
+            default:
+                fsm->state = JOYKEY_STATE_IDLE;
+                fsm->count = 0U;
+                break;
+        }
+    }
+}
+
+uint8_t Joystick_KeyIsDown(uint8_t key)
+{
+    if ((key >= JOYKEY_COUNT) ||
+        ((s_joyKeyFsm[key].state != JOYKEY_STATE_PRESSED) &&
+         (s_joyKeyFsm[key].state != JOYKEY_STATE_RELEASE_DEBOUNCE)))
+    {
+        return 0U;
+    }
+    return 1U;
+}

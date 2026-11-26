@@ -62,7 +62,13 @@ int16_t Joystick_MapRawValue(uint8_t axis, uint16_t rawValue);
 void Joystick_StateInit(Joystick_State *state, uint8_t xAxis, uint8_t yAxis);
 void Joystick_Update(Joystick_State *state);
 
-/* 按下返回 0，松开返回 1 */
+/* 摇杆按键原始电平：按下返回 0，松开返回 1。仅供状态机采样使用。 */
 uint8_t Joystick_GetKeyState(uint8_t key);
+
+/* L3/R3 独立状态机：10ms 调用一次，20ms 按下/释放消抖。
+ * USB 与蓝牙任务只读取 Joystick_KeyIsDown()，不得各自重复更新状态机。 */
+void Joystick_KeyInit(void);
+void Joystick_KeyUpdate(void);
+uint8_t Joystick_KeyIsDown(uint8_t key);
 
 #endif

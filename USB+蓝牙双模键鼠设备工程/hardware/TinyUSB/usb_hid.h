@@ -9,7 +9,8 @@
 #define HID_DESC_LEN_MOUSE          77
 #define HID_DESC_LEN_CUSTOM         27
 
-#define USB_HID_CUSTOM_REPORT_LEN   8
+/* 输入报告 9 字节：rep[8] 为 L3/R3 状态；输出报告仍为 8 字节。 */
+#define USB_HID_CUSTOM_REPORT_LEN   9
 
 /* 自定义 HID 输出报告的命令字 */
 #define USB_HID_CMD_SET_RGB         0x01
