@@ -33,6 +33,71 @@ constexpr quint8 kCmdGetStatus    = 0x02;
 constexpr quint8 kCmdRainbowStart = 0x03;
 constexpr quint8 kCmdRainbowStop  = 0x04;
 
+/* USB Feature Report：首字节为 Windows Report ID 占位 0，后接 32B 配置。 */
+constexpr int kConfigSize = 32;
+constexpr int kConfigXferSize = kConfigSize + 1;
+constexpr quint8 kConfigMagic = 0x4B;
+constexpr quint8 kConfigVersion = 1;
+constexpr quint8 kConfigCmdSave = 1;
+constexpr quint8 kConfigCmdDefault = 2;
+constexpr quint16 actionKeyboard(quint8 usage) { return quint16(0x0100u | usage); }
+constexpr quint16 actionModifier(quint8 mask) { return quint16(0x0200u | mask); }
+constexpr quint16 actionMouse(quint8 mask) { return quint16(0x0300u | mask); }
+
+inline quint32 configCrc(const QByteArray &data, int len = 28)
+{
+    quint32 crc = 0xFFFFFFFFu;
+    for (int i = 0; i < len; ++i) {
+        crc ^= quint8(data.at(i));
+        for (int bit = 0; bit < 8; ++bit)
+            crc = (crc >> 1) ^ ((crc & 1u) ? 0xEDB88320u : 0u);
+    }
+    return ~crc;
+}
+
+inline void put16(QByteArray &data, int at, quint16 value)
+{
+    data[at] = char(value & 0xFFu); data[at + 1] = char(value >> 8);
+}
+inline quint16 get16(const QByteArray &data, int at)
+{
+    return quint16(quint8(data.at(at)) | (quint8(data.at(at + 1)) << 8));
+}
+inline void put32(QByteArray &data, int at, quint32 value)
+{
+    for (int i = 0; i < 4; ++i) data[at + i] = char((value >> (i * 8)) & 0xFFu);
+}
+inline quint32 get32(const QByteArray &data, int at)
+{
+    quint32 value = 0;
+    for (int i = 0; i < 4; ++i) value |= quint32(quint8(data.at(at + i))) << (i * 8);
+    return value;
+}
+inline void sealConfig(QByteArray &data)
+{
+    put32(data, 28, 0); put32(data, 28, configCrc(data));
+}
+inline QByteArray defaultConfig()
+{
+    static const quint16 actions[9] = {
+        actionMouse(1), actionMouse(2), actionKeyboard(0x39), actionKeyboard(0x53),
+        actionKeyboard(0x2C), actionKeyboard(0x28), actionMouse(4),
+        actionModifier(2), actionModifier(1)
+    };
+    QByteArray data(kConfigSize, char(0));
+    data[0] = char(kConfigMagic); data[1] = char(kConfigVersion);
+    for (int i = 0; i < 9; ++i) put16(data, 4 + i * 2, actions[i]);
+    data[22] = char(100); data[23] = char(100);
+    put16(data, 24, 9000); put16(data, 26, 12000);
+    sealConfig(data);
+    return data;
+}
+inline bool validConfig(const QByteArray &data)
+{
+    return data.size() >= kConfigSize && quint8(data.at(0)) == kConfigMagic &&
+           quint8(data.at(1)) == kConfigVersion && get32(data, 28) == configCrc(data);
+}
+
 struct KeyDef
 {
     const char *name;

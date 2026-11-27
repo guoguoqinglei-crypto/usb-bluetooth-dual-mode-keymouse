@@ -7,7 +7,7 @@
 
 #define HID_DESC_LEN_KEYBOARD       65
 #define HID_DESC_LEN_MOUSE          77
-#define HID_DESC_LEN_CUSTOM         27
+#define HID_DESC_LEN_CUSTOM         33
 
 /* 输入报告 9 字节：rep[8] 为 L3/R3 状态；输出报告仍为 8 字节。 */
 #define USB_HID_CUSTOM_REPORT_LEN   9

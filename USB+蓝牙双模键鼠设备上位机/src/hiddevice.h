@@ -59,6 +59,10 @@ public:
      * slider drag cannot flood the endpoint. */
     bool sendOutputReport(const QByteArray &frame);
 
+    /* Feature Report 也在写线程执行；空帧表示读取，非空帧表示写入。 */
+    bool requestFeatureReport();
+    bool sendFeatureReport(const QByteArray &frame);
+
     int  pendingWrites();
 
     /* 只统计写线程中真正成功的 HID 输出报告，供考核记录使用。 */
@@ -68,6 +72,7 @@ signals:
     void reportReceived(const QByteArray &raw);
     void disconnected(const QString &reason);
     void logLine(const QString &text);
+    void featureResult(bool success, bool write, const QByteArray &data, const QString &error);
 
 private:
     void readLoop();
@@ -84,6 +89,7 @@ private:
 
     QMutex m_queueMutex;
     QList<QByteArray> m_queue;
+    QList<QByteArray> m_featureQueue;
     int     m_writeMode = 0;   /* 0 = unknown, 1 = SET_REPORT, 2 = interrupt OUT */
     quint64 m_writeErrors = 0;
     std::atomic<quint64> m_outOk{0};

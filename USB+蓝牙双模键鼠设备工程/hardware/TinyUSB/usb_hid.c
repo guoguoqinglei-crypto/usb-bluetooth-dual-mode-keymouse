@@ -13,7 +13,7 @@
 #include <joystick.h>
 #include <tim2.h>
 #include <uart.h>
-#include <uart.h>
+#include <km_config.h>
 
 static const uint8_t desc_kbd[] = { TUD_HID_REPORT_DESC_KEYBOARD() };
 
@@ -33,6 +33,9 @@ static const uint8_t desc_custom[] =
     0x09, 0x02,
     0x95, 0x08,                 /* 输出仍 8B，保持 RGB 命令协议兼容 */
     0x91, 0x02,
+    0x09, 0x03,
+    0x95, 0x20,                 /* Feature 32B：改键、摇杆参数和保存状态 */
+    0xB1, 0x02,
     0xC0
 };
 
@@ -527,6 +530,7 @@ static uint8_t  s_seq          = 0U;
 static uint32_t s_last_beat_ms = 0U;
 
 static uint8_t  s_kbd_hold       = 0U;
+static uint8_t  s_kbd_mapped[6]  = { 0U, 0U, 0U, 0U, 0U, 0U };
 static uint8_t  s_kbd_modifier   = 0U;  /* 独立修饰键，可与普通键码同时上报 */
 static uint8_t  s_kbd_raw        = 0U;
 static uint8_t  s_kbd_stable     = 0U;
@@ -601,31 +605,7 @@ static void joy_rotate(int32_t lx, int32_t ly, int32_t *mx, int32_t *my)
 
 static int8_t axis_to_move(int32_t v)
 {
-    int32_t a = (v < 0) ? -v : v;
-    int32_t t;
-    int32_t n;
-    int32_t m;
-
-    if (a <= USB_JOY_DEADZONE)
-    {
-        return 0;
-    }
-
-    t = a - USB_JOY_DEADZONE;
-    n = 32767 - USB_JOY_DEADZONE;
-
-    m = (int32_t)(((int64_t)t * t * USB_JOY_MOUSE_MAX + (int64_t)n * n / 2)
-                  / ((int64_t)n * n));
-    if (m < 1)
-    {
-        m = 1;
-    }
-    else if (m > USB_JOY_MOUSE_MAX)
-    {
-        m = USB_JOY_MOUSE_MAX;
-    }
-
-    return (v < 0) ? (int8_t)(-m) : (int8_t)m;
+    return KMConfig_AxisToMove(v);   /* USB/BT 共用灵敏度、死区和二次曲线 */
 }
 
 /* 点按（CapsLock / NumLock）成功发出按下报告后，至少保持 30ms 再释放。 */
@@ -638,6 +618,7 @@ static void kbd_reset_state(void)
     s_kbd_raw    = 0U;
     s_kbd_stable = 0U;
     s_kbd_dirty  = 1U;
+    memset(s_kbd_mapped, 0, sizeof(s_kbd_mapped));
 
     memset(s_lock_raw, 0, sizeof(s_lock_raw));
     memset(s_lock_down, 0, sizeof(s_lock_down));
@@ -657,7 +638,11 @@ static void kbd_flush(void)
     {
         keys[n++] = s_kbd_hold;
     }
-    for (i = 0U; i < USB_LOCK_KEY_COUNT; i++)
+    for (i = 0U; (i < 6U) && (n < 6U); i++)
+    {
+        if (s_kbd_mapped[i] != 0U) { keys[n++] = s_kbd_mapped[i]; }
+    }
+    for (i = 0U; (i < USB_LOCK_KEY_COUNT) && (n < 6U); i++)
     {
         if (s_lock_tap_active[i] != 0U)
         {
@@ -695,55 +680,73 @@ static void kbd_scan(void)
     uint8_t want = 0U;
     uint8_t modifier = 0U;
     uint8_t i;
+    const uint8_t defaultMap = KMConfig_IsDefaultMapping();
 
-    /* L3/R3 已由各自的独立状态机完成 20ms 消抖；这里只组合 HID 修饰键位。
-     * 两键可叠加，且不影响 UP/DN/X/Y 的普通键码。 */
-    if (Joystick_KeyIsDown(JOYSTICK_L3) != 0U)
+    if (defaultMap != 0U)
     {
-        modifier |= 0x02U;          /* HID Modifier: Left Shift */
+        /* 默认映射沿用已经验收的点按/消抖行为。 */
+        if (s_kbd_mapped[0] | s_kbd_mapped[1] | s_kbd_mapped[2] |
+            s_kbd_mapped[3] | s_kbd_mapped[4] | s_kbd_mapped[5])
+        {
+            memset(s_kbd_mapped, 0, sizeof(s_kbd_mapped));
+            s_kbd_dirty = 1U;
+        }
+        if (Joystick_KeyIsDown(JOYSTICK_L3) != 0U) { modifier |= 0x02U; }
+        if (Joystick_KeyIsDown(JOYSTICK_R3) != 0U) { modifier |= 0x01U; }
+        if (Key_IsDown(KEY_UP) != 0u) { want = 0x2CU; }
+        else if (Key_IsDown(KEY_DN) != 0u) { want = 0x28U; }
+
+        if (want != s_kbd_raw) { s_kbd_raw = want; s_kbd_stable = 0U; }
+        else if (s_kbd_stable < 2U) { s_kbd_stable++; }
+        if ((s_kbd_stable >= 2U) && (s_kbd_hold != s_kbd_raw))
+        {
+            s_kbd_hold = s_kbd_raw;
+            s_kbd_dirty = 1U;
+        }
     }
-    if (Joystick_KeyIsDown(JOYSTICK_R3) != 0U)
+    else
     {
-        modifier |= 0x01U;          /* HID Modifier: Left Ctrl */
+        uint8_t next[6];
+        uint8_t bm = 0U;
+        uint8_t joy = 0U;
+
+        for (i = KEY_A; i <= KEY_LF; ++i)
+        {
+            if (Key_IsDown(i) != 0u) { bm |= (uint8_t)(1U << (i - KEY_A)); }
+        }
+        if (Joystick_KeyIsDown(JOYSTICK_L3) != 0U) { joy |= 0x01U; }
+        if (Joystick_KeyIsDown(JOYSTICK_R3) != 0U) { joy |= 0x02U; }
+
+        /* 未改动的 X/Y 仍走原来的 Caps/Num 点按状态机，其余键走通用映射。 */
+        if (KMConfig_Action(KM_KEY_X) == KM_ACTION_KEYBOARD(0x39U)) { bm &= ~0x04U; }
+        if (KMConfig_Action(KM_KEY_Y) == KM_ACTION_KEYBOARD(0x53U)) { bm &= ~0x08U; }
+        modifier = KMConfig_BuildKeyboard(bm, joy, next);
+        if ((memcmp(next, s_kbd_mapped, sizeof(next)) != 0) || (s_kbd_hold != 0U))
+        {
+            memcpy(s_kbd_mapped, next, sizeof(next));
+            s_kbd_hold = 0U;
+            s_kbd_raw = 0U;
+            s_kbd_stable = 0U;
+            s_kbd_dirty = 1U;
+        }
     }
+
     if (modifier != s_kbd_modifier)
     {
         s_kbd_modifier = modifier;
         s_kbd_dirty = 1U;
-        UART1_Printf("[usb] modifier 0x%02X (L3=Shift, R3=Ctrl)\r\n",
-                     (unsigned)modifier);
     }
 
-    /* --- UP / DN：先采样，再 20ms 消抖 --- */
-    if (Key_IsDown(KEY_UP) != 0u)
-    {
-        want = 0x2CU;               /* HID_KEY_SPACE：主键盘空格 */
-    }
-    else if (Key_IsDown(KEY_DN) != 0u)
-    {
-        want = 0x28U;               /* HID_KEY_ENTER：主键盘回车 */
-    }
-
-    if (want != s_kbd_raw)
-    {
-        s_kbd_raw    = want;
-        s_kbd_stable = 0U;
-    }
-    else if (s_kbd_stable < 2U)
-    {
-        s_kbd_stable++;
-    }
-
-    if ((s_kbd_stable >= 2U) && (s_kbd_hold != s_kbd_raw))
-    {
-        s_kbd_hold = s_kbd_raw;
-        s_kbd_dirty = 1U;
-        UART1_Printf("[usb] kbd hold 0x%02X\r\n", (unsigned)s_kbd_hold);
-    }
-
-    /* --- X / Y：独立消抖，确认按下时触发一次，长按不会变成“无事件”。 --- */
+    /* X/Y 的默认 Caps/Num 点按状态机保留；改成其它动作后不再重复触发。 */
     for (i = 0U; i < USB_LOCK_KEY_COUNT; i++)
     {
+        const uint16_t expected = KM_ACTION_KEYBOARD(s_lock_hid_code[i]);
+        if (KMConfig_Action((uint8_t)(KM_KEY_X + i)) != expected)
+        {
+            s_lock_tap_active[i] = 0U;
+            s_lock_tap_sent[i] = 0U;
+            continue;
+        }
         if ((s_lock_tap_active[i] != 0U) && (s_lock_tap_sent[i] != 0U) &&
             ((uint32_t)(s_millis - s_lock_tap_ms[i]) >= USB_KBD_TAP_MS))
         {
@@ -753,15 +756,8 @@ static void kbd_scan(void)
         }
 
         want = (Key_IsDown(s_lock_key_id[i]) != 0u) ? 1U : 0U;
-        if (want != s_lock_raw[i])
-        {
-            s_lock_raw[i] = want;
-            s_lock_debounce[i] = 0U;
-        }
-        else if (s_lock_debounce[i] < 2U)
-        {
-            s_lock_debounce[i]++;
-        }
+        if (want != s_lock_raw[i]) { s_lock_raw[i] = want; s_lock_debounce[i] = 0U; }
+        else if (s_lock_debounce[i] < 2U) { s_lock_debounce[i]++; }
 
         if ((s_lock_debounce[i] >= 2U) && (s_lock_down[i] != want))
         {
@@ -776,12 +772,7 @@ static void kbd_scan(void)
         }
     }
 
-    /* 每次扫描都重试未成功发送的键盘状态；上位机打开自定义 HID 后
-     * 端点调度更忙，也不能因此丢掉整个键盘接口的按下或释放报告。 */
-    if (s_kbd_dirty != 0U)
-    {
-        kbd_flush();
-    }
+    if (s_kbd_dirty != 0U) { kbd_flush(); }
 }
 
 /* 10ms 一次的鼠标扫描 */
@@ -792,21 +783,19 @@ static void mouse_scan(void)
     int8_t   dx = 0;
     int8_t   dy = 0;
     int8_t   wheel = 0;
-    uint8_t  buttons = 0U;
+    uint8_t  buttons;
+    uint8_t  bm = 0U;
+    uint8_t  joy = 0U;
+    uint8_t  k;
 
-    /* 按键：统一用状态机消抖后的稳定状态 Key_IsDown()（1 = 按下） */
-    if (Key_IsDown(KEY_A) != 0u)
+    /* 鼠标按键与普通键盘/修饰键共用同一份可配置物理输入状态。 */
+    for (k = KEY_A; k <= KEY_LF; ++k)
     {
-        buttons |= 0x01U;       /* 左键 */
+        if (Key_IsDown(k) != 0u) { bm |= (uint8_t)(1U << (k - KEY_A)); }
     }
-    if (Key_IsDown(KEY_B) != 0u)
-    {
-        buttons |= 0x02U;       /* 右键 */
-    }
-    if (Key_IsDown(KEY_LF) != 0u)
-    {
-        buttons |= 0x04U;       /* 中键 */
-    }
+    if (Joystick_KeyIsDown(JOYSTICK_L3) != 0U) { joy |= 0x01U; }
+    if (Joystick_KeyIsDown(JOYSTICK_R3) != 0U) { joy |= 0x02U; }
+    buttons = KMConfig_BuildMouse(bm, joy);
 
     /* 左摇杆 -> 光标位移：原始 ADC 滤波，再旋转、死区和速度映射 */
     lx = mouse_read_axis(JOYSTICK_LX);
@@ -833,14 +822,7 @@ static void mouse_scan(void)
         joy_rotate(rx, ry, &wx, &wy);
         (void)wx;
 
-        if (wy > USB_WHEEL_THRESHOLD)
-        {
-            wheel = 1;
-        }
-        else if (wy < -USB_WHEEL_THRESHOLD)
-        {
-            wheel = -1;
-        }
+        wheel = KMConfig_Wheel(wy);
 
 #if USB_WHEEL_INVERT
         wheel = (int8_t)(-wheel);
@@ -1034,7 +1016,14 @@ uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id,
                                uint8_t *buffer, uint16_t reqlen)
 {
     (void)report_id;
-    (void)report_type;
+
+    if ((instance == USB_HID_INST_CUSTOM) &&
+        (report_type == HID_REPORT_TYPE_FEATURE))
+    {
+        if (reqlen < KM_CONFIG_SIZE) { return 0U; }
+        KMConfig_GetFeature(buffer, reqlen);
+        return KM_CONFIG_SIZE;
+    }
 
     if (instance == USB_HID_INST_KEYBOARD)
     {
@@ -1085,6 +1074,13 @@ void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id,
         (report_type == HID_REPORT_TYPE_OUTPUT))
     {
         UsbHid_SetKeyboardLeds(buffer[0]);
+        return;
+    }
+
+    if ((instance == USB_HID_INST_CUSTOM) &&
+        (report_type == HID_REPORT_TYPE_FEATURE))
+    {
+        (void)KMConfig_SetFeature(buffer, bufsize); /* 不在控制回调中擦写 Flash */
         return;
     }
 

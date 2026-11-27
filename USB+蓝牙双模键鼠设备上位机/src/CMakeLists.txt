@@ -18,6 +18,8 @@ set(PROJECT_SOURCES
     hiddevice.h
     protocol.h
     dashboard.h
+    performance_monitor.cpp
+    performance_monitor.h
 )
 
 qt_add_executable(shujianffuhe WIN32 MANUAL_FINALIZATION ${PROJECT_SOURCES})

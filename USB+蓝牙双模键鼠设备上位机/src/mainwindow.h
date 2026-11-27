@@ -14,6 +14,7 @@
 
 class QLabel; class QPushButton; class QComboBox; class QSlider; class QSpinBox;
 class QCheckBox; class QPlainTextEdit; class QLineEdit; class QGroupBox;
+class PerformanceMonitor;
 
 class KeyIndicator : public QWidget
 {
@@ -81,6 +82,11 @@ private slots:
     void onSendTick();
     void onUiTick();
     void onFlushLog();
+    void onConfigRead();
+    void onConfigWrite();
+    void onConfigDefault();
+    void onConfigPoll();
+    void onFeatureResult(bool success, bool write, const QByteArray &data, const QString &error);
 private:
     void buildUi();
     void setConnected(bool on);
@@ -99,6 +105,7 @@ private:
     void saveSettings();
 
     HidDevice m_hid;
+    PerformanceMonitor *m_performance = nullptr;
     QList<HidDeviceInfo> m_devices;
 
     QComboBox *m_deviceCombo = nullptr;
@@ -115,6 +122,14 @@ private:
     QPlainTextEdit *m_logView = nullptr;
     QLineEdit *m_rawEdit = nullptr;
     QGroupBox *m_rgbBox = nullptr;
+    QGroupBox *m_configBox = nullptr;
+    QVector<QComboBox *> m_actionCombos;
+    QSpinBox *m_sens[2] = { nullptr, nullptr };
+    QSpinBox *m_deadzone[2] = { nullptr, nullptr };
+    QLabel *m_configStatus = nullptr;
+    QTimer m_configPollTimer;
+    int m_configPolls = 0;
+    bool m_configWaitingSave = false;
     Dashboard::MetricCard *m_framesCard = nullptr;
     Dashboard::MetricCard *m_keysCard = nullptr;
     Dashboard::MetricCard *m_lossCard = nullptr;

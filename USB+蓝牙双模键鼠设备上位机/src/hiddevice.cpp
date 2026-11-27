@@ -203,6 +203,7 @@ bool HidDevice::open(const HidDeviceInfo &info)
     {
         QMutexLocker lock(&m_queueMutex);
         m_queue.clear();
+        m_featureQueue.clear();
     }
     m_stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     m_writeEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
@@ -246,6 +247,7 @@ void HidDevice::close()
 
     QMutexLocker lock(&m_queueMutex);
     m_queue.clear();
+        m_featureQueue.clear();
 }
 
 void HidDevice::readLoop()
@@ -313,12 +315,52 @@ bool HidDevice::sendOutputReport(const QByteArray &frame)
     return true;
 }
 
+bool HidDevice::requestFeatureReport()
+{
+    return sendFeatureReport(QByteArray());
+}
+
+bool HidDevice::sendFeatureReport(const QByteArray &frame)
+{
+    if (!m_handle || m_info.isBluetooth()) return false;
+    if (!frame.isEmpty() && frame.size() != Proto::kConfigXferSize) return false;
+    {
+        QMutexLocker lock(&m_queueMutex);
+        if (m_featureQueue.size() >= 8) return false;
+        m_featureQueue.append(frame);       /* 空帧是合法的读取命令 */
+    }
+    if (m_writeEvent) SetEvent(static_cast<HANDLE>(m_writeEvent));
+    return true;
+}
+
 /* 写线程：真正的 USB 传输都在这里做，GUI 线程只负责入队 */
 void HidDevice::writeLoop()
 {
     HANDLE ev = static_cast<HANDLE>(m_writeEvent);
 
     while (m_running) {
+        QByteArray feature;
+        bool hasFeature = false;
+        {
+            QMutexLocker lock(&m_queueMutex);
+            if (!m_featureQueue.isEmpty()) {
+                feature = m_featureQueue.takeFirst();
+                hasFeature = true;
+            }
+        }
+        if (hasFeature) {
+            HANDLE h = static_cast<HANDLE>(m_handle);
+            const bool write = !feature.isEmpty();
+            QByteArray buf = write ? feature : QByteArray(Proto::kConfigXferSize, char(0));
+            const BOOL ok = write
+                ? HidD_SetFeature(h, reinterpret_cast<PVOID>(buf.data()), Proto::kConfigXferSize)
+                : HidD_GetFeature(h, reinterpret_cast<PVOID>(buf.data()), Proto::kConfigXferSize);
+            const DWORD error = ok ? ERROR_SUCCESS : GetLastError();
+            emit featureResult(ok != 0, write, write ? QByteArray() : buf,
+                               ok ? QString() : winError(error));
+            continue;
+        }
+
         QByteArray frame;
         {
             QMutexLocker lock(&m_queueMutex);

@@ -845,6 +845,16 @@
               <FilePath>.\hardware\bt_gamepad.c</FilePath>
             </File>
             <File>
+              <FileName>km_config.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\hardware\km_config.c</FilePath>
+            </File>
+            <File>
+              <FileName>km_config.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\hardware\km_config.h</FilePath>
+            </File>
+            <File>
               <FileName>bt_hci.h</FileName>
               <FileType>5</FileType>
               <FilePath>.\hardware\bt_hci.h</FilePath>

@@ -8,6 +8,7 @@
 #include "mainwindow.h"
 #include "protocol.h"
 #include "dashboard.h"
+#include "performance_monitor.h"
 
 #include <QApplication>
 #include <QComboBox>
@@ -38,6 +39,19 @@
 #include <QFile>
 #include <QRegularExpression>
 #include <QScrollBar>
+#include <QScrollArea>
+#include <QFrame>
+
+/* 页内容保持合理高度，窗口不够高时由外层滚动条浏览，避免压缩文字和控件。 */
+static QScrollArea *makeScrollPage(QWidget *content, int minimumHeight)
+{
+    content->setMinimumHeight(minimumHeight);
+    auto *area = new QScrollArea;
+    area->setWidgetResizable(true);
+    area->setFrameShape(QFrame::NoFrame);
+    area->setWidget(content);
+    return area;
+}
 
 /* ---------------------------------------------------------------------------
  * ColorSwatch：自绘色块。用 QLabel + setStyleSheet 改背景时 Qt 每次都要重新
@@ -89,7 +103,7 @@ KeyIndicator::KeyIndicator(const QString &name, const QString &func,
                            const QColor &color, QWidget *parent)
     : QWidget(parent), m_name(name), m_func(func), m_color(color)
 {
-    setMinimumSize(150, 46);
+    setMinimumSize(185, 58);
     setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
 }
 
@@ -118,7 +132,6 @@ void KeyIndicator::paintEvent(QPaintEvent *)
     p.setRenderHint(QPainter::Antialiasing, true);
     const int h = height();
 
-    /* 圆灯 */
     QColor lamp = m_down ? m_color : QColor(220, 224, 230);
     if (m_down) {
         QColor glow = m_color;
@@ -131,24 +144,29 @@ void KeyIndicator::paintEvent(QPaintEvent *)
     p.setPen(QPen(m_color.darker(140), 1));
     p.drawEllipse(9, h / 2 - 10, 20, 20);
 
-    /* 名称：按下时加粗 */
+    /* 名称、说明和次数分区绘制；所有宽度随控件变化，不再固定为 130px。 */
+    const QRect nameRect(40, 3, width() - 96, h / 2 - 2);
+    const QRect countRect(width() - 50, 3, 46, h / 2 - 2);
+    const QRect functionRect(40, h / 2, width() - 50, h / 2 - 3);
     QFont f = font();
     f.setBold(m_down);
-    f.setPointSize(11);
+    f.setPointSize(10);
     p.setFont(f);
-    p.setPen(m_down ? m_color.darker(170) : QColor(60, 66, 76));
-    p.drawText(40, 0, 46, h / 2 + 4, Qt::AlignLeft | Qt::AlignBottom, m_name);
+    p.setPen(m_down ? m_color.darker(170) : QColor(48, 55, 65));
+    p.drawText(nameRect, Qt::AlignLeft | Qt::AlignVCenter,
+               QFontMetrics(f).elidedText(m_name, Qt::ElideRight, nameRect.width()));
 
-    /* 功能说明 + 次数 */
     QFont sf = font();
-    sf.setPointSize(8);
+    sf.setPointSize(9);
     p.setFont(sf);
-    p.setPen(QColor(120, 126, 136));
-    p.drawText(40, h / 2, 130, h / 2, Qt::AlignLeft | Qt::AlignTop, m_func);
+    p.setPen(QColor(96, 105, 116));
+    p.drawText(functionRect, Qt::AlignLeft | Qt::AlignVCenter,
+               QFontMetrics(sf).elidedText(m_func, Qt::ElideRight, functionRect.width()));
 
-    p.setPen(m_down ? m_color.darker(150) : QColor(150, 156, 166));
-    p.drawText(width() - 46, 0, 42, h, Qt::AlignRight | Qt::AlignVCenter,
-               QString("x%1").arg(m_count));
+    p.setFont(f);
+    p.setPen(m_down ? m_color.darker(150) : QColor(120, 128, 138));
+    p.drawText(countRect, Qt::AlignRight | Qt::AlignVCenter,
+               QStringLiteral("x%1").arg(m_count));
 }
 
 /* ---------------------------------------------------------------------------
@@ -180,6 +198,11 @@ MainWindow::MainWindow(QWidget *parent)
             this, &MainWindow::onDeviceLost, Qt::QueuedConnection);
     connect(&m_hid, &HidDevice::logLine,
             this, &MainWindow::onLog, Qt::QueuedConnection);
+    connect(&m_hid, &HidDevice::featureResult,
+            this, &MainWindow::onFeatureResult, Qt::QueuedConnection);
+    m_configPollTimer.setSingleShot(true);
+    m_configPollTimer.setInterval(100);
+    connect(&m_configPollTimer, &QTimer::timeout, this, &MainWindow::onConfigPoll);
 
     /* 2 秒一次：枚举要遍历全部 HID 接口并逐个打开句柄，1 秒一次在断开状态下
      * 会有周期性的小卡顿 */
@@ -408,7 +431,7 @@ void MainWindow::buildUi()
     auto *workspace = new QTabWidget(central);
     auto *monitorPage = new QWidget(workspace);
     monitorPage->setLayout(body);
-    workspace->addTab(monitorPage, QStringLiteral("实时监测"));
+    workspace->addTab(makeScrollPage(monitorPage, 590), QStringLiteral("实时监测"));
     root->addWidget(workspace, 1);
 
     m_assessmentBar = new Dashboard::AssessmentBar(central);
@@ -468,7 +491,91 @@ void MainWindow::buildUi()
     logBtnLay->addWidget(saveBtn);
     logLay->addLayout(logBtnLay);
     logBox->setTitle(QStringLiteral("原始数据与事件"));
-    workspace->addTab(logBox, QStringLiteral("通信日志"));
+    workspace->addTab(makeScrollPage(logBox, 480), QStringLiteral("通信日志"));
+
+    /* ---------- 设备配置：USB Feature Report，写入时才擦写 Flash ---------- */
+    m_configBox = new QGroupBox(QStringLiteral("改键与摇杆参数（通过 USB 配置，USB / 蓝牙输出共用）"), workspace);
+    auto *configLay = new QVBoxLayout(m_configBox);
+    auto *keyGridConfig = new QGridLayout;
+    const char *configNames[9] = { "A", "B", "X", "Y", "UP", "DN", "LF", "L3", "R3" };
+    for (int i = 0; i < 9; ++i) {
+        auto *combo = new QComboBox(m_configBox);
+        combo->addItem(QStringLiteral("无动作"), 0x0000);
+        combo->addItem(QStringLiteral("鼠标左键"), Proto::actionMouse(1));
+        combo->addItem(QStringLiteral("鼠标右键"), Proto::actionMouse(2));
+        combo->addItem(QStringLiteral("鼠标中键"), Proto::actionMouse(4));
+        for (int key = 0; key < 26; ++key)
+            combo->addItem(QStringLiteral("键盘 %1").arg(QChar('A' + key)), Proto::actionKeyboard(quint8(0x04 + key)));
+        for (int key = 0; key < 10; ++key) {
+            const int usage = (key == 0) ? 0x27 : (0x1D + key);
+            combo->addItem(QStringLiteral("键盘 %1").arg(key), Proto::actionKeyboard(quint8(usage)));
+        }
+        const struct { const char *name; quint8 usage; } specials[] = {
+            { "回车 Enter", 0x28 }, { "Esc", 0x29 }, { "退格 Backspace", 0x2A },
+            { "Tab", 0x2B }, { "空格 Space", 0x2C }, { "Caps Lock", 0x39 },
+            { "Num Lock", 0x53 }, { "F1", 0x3A }, { "F2", 0x3B }, { "F3", 0x3C },
+            { "F4", 0x3D }, { "方向 →", 0x4F }, { "方向 ←", 0x50 },
+            { "方向 ↓", 0x51 }, { "方向 ↑", 0x52 }
+        };
+        for (const auto &item : specials)
+            combo->addItem(QString::fromUtf8(item.name), Proto::actionKeyboard(item.usage));
+        combo->addItem(QStringLiteral("左 Ctrl"), Proto::actionModifier(0x01));
+        combo->addItem(QStringLiteral("左 Shift"), Proto::actionModifier(0x02));
+        combo->addItem(QStringLiteral("左 Alt"), Proto::actionModifier(0x04));
+        combo->addItem(QStringLiteral("左 Win"), Proto::actionModifier(0x08));
+        combo->addItem(QStringLiteral("右 Ctrl"), Proto::actionModifier(0x10));
+        combo->addItem(QStringLiteral("右 Shift"), Proto::actionModifier(0x20));
+        combo->addItem(QStringLiteral("右 Alt"), Proto::actionModifier(0x40));
+        combo->addItem(QStringLiteral("右 Win"), Proto::actionModifier(0x80));
+        m_actionCombos.append(combo);
+        const int labelColumn = (i % 3) * 2;
+        auto *keyLabel = new QLabel(QString::fromUtf8(configNames[i]), m_configBox);
+        keyLabel->setFixedWidth(38);
+        keyLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+        keyGridConfig->addWidget(keyLabel, i / 3, labelColumn);
+        keyGridConfig->addWidget(combo, i / 3, labelColumn + 1);
+        keyGridConfig->setColumnStretch(labelColumn, 0);
+        keyGridConfig->setColumnStretch(labelColumn + 1, 1);
+    }
+    configLay->addLayout(keyGridConfig);
+
+    auto *joyGrid = new QGridLayout;
+    const char *stickNames[2] = { "左摇杆（光标）", "右摇杆（滚轮）" };
+    for (int i = 0; i < 2; ++i) {
+        joyGrid->addWidget(new QLabel(QString::fromUtf8(stickNames[i]), m_configBox), i, 0);
+        m_sens[i] = new QSpinBox(m_configBox);
+        m_sens[i]->setRange(25, 200); m_sens[i]->setSingleStep(5); m_sens[i]->setSuffix(QStringLiteral(" %"));
+        m_deadzone[i] = new QSpinBox(m_configBox);
+        m_deadzone[i]->setRange(0, 24000); m_deadzone[i]->setSingleStep(500);
+        joyGrid->addWidget(new QLabel(QStringLiteral("灵敏度"), m_configBox), i, 1);
+        joyGrid->addWidget(m_sens[i], i, 2);
+        joyGrid->addWidget(new QLabel(QStringLiteral("死区 / 阈值"), m_configBox), i, 3);
+        joyGrid->addWidget(m_deadzone[i], i, 4);
+    }
+    configLay->addLayout(joyGrid);
+    auto *configButtons = new QHBoxLayout;
+    auto *readConfig = new QPushButton(QStringLiteral("读取配置"), m_configBox);
+    auto *writeConfig = new QPushButton(QStringLiteral("写入并保存"), m_configBox);
+    auto *defaultConfig = new QPushButton(QStringLiteral("恢复默认并保存"), m_configBox);
+    writeConfig->setProperty("primary", true);
+    configButtons->addWidget(readConfig); configButtons->addWidget(writeConfig);
+    configButtons->addWidget(defaultConfig); configButtons->addStretch(1);
+    configLay->addLayout(configButtons);
+    m_configStatus = new QLabel(QStringLiteral("USB 连接后可读取；只有点击保存才写 Flash。"), m_configBox);
+    m_configStatus->setWordWrap(true);
+    configLay->addWidget(m_configStatus);
+    workspace->addTab(makeScrollPage(m_configBox, 420), QStringLiteral("设备配置"));
+    connect(readConfig, &QPushButton::clicked, this, &MainWindow::onConfigRead);
+    connect(writeConfig, &QPushButton::clicked, this, &MainWindow::onConfigWrite);
+    connect(defaultConfig, &QPushButton::clicked, this, &MainWindow::onConfigDefault);
+
+    m_performance = new PerformanceMonitor(workspace);
+    m_performance->setSequenceSupport(true);
+    workspace->addTab(makeScrollPage(m_performance, 700), QStringLiteral("性能测试"));
+    connect(m_performance, &PerformanceMonitor::resetRequested,
+            this, &MainWindow::onClearCounters);
+    connect(m_performance, &PerformanceMonitor::exportRequested,
+            this, &MainWindow::onExportReport);
 
     /* ---------- status bar ---------- */
     m_modeLabel = new QLabel(this);
@@ -525,11 +632,18 @@ void MainWindow::onRefreshDevices()
 void MainWindow::setConnected(bool on)
 {
     m_connected = on;
+    m_performance->setConnectionState(on);
     m_connectBtn->setText(on ? QStringLiteral("断开连接") : QStringLiteral("连接设备"));
     m_deviceCombo->setEnabled(!on);
     m_refreshBtn->setEnabled(!on);
     m_rgbBox->setEnabled(on);
+    m_configBox->setEnabled(on && !m_hid.info().isBluetooth());
+    if (!on) {
+        m_configWaitingSave = false;
+        m_configPollTimer.stop();
+    }
     if (on) {
+        if (!m_hid.info().isBluetooth()) QTimer::singleShot(200, this, &MainWindow::onConfigRead);
         m_connLabel->setText(m_hid.info().transportName() + QStringLiteral(" 已连接"));
         m_connLabel->setStyleSheet(QStringLiteral("color:#7EE2B8;font-weight:bold;"));
         m_connTime.restart();
@@ -631,8 +745,12 @@ void MainWindow::onLog(const QString &text)
  * ------------------------------------------------------------------------- */
 void MainWindow::onReport(const QByteArray &raw)
 {
+    const qint64 perfNow = QDateTime::currentMSecsSinceEpoch();
     QByteArray body = Proto::stripReportId(raw, m_hid.info().reportId());
-    if (body.size() < 2) return;
+    if (body.size() < 2) {
+        m_performance->recordInput(perfNow, false);
+        return;
+    }
     const quint8 bm = quint8(body.at(0));
     const quint8 seq = quint8(body.at(1));
     const quint8 led = (body.size() > 2) ? quint8(body.at(2)) : quint8(0);
@@ -663,10 +781,13 @@ void MainWindow::onReport(const QByteArray &raw)
     m_seenLedState = quint8(m_seenLedState | led);
     m_uiDirty = true;
 
+    quint64 lost = 0;
     if (m_lastSeq >= 0 && seq != quint8((m_lastSeq + 1) & 0xFF)) {
-        m_lostFrames += (quint8)(seq - quint8(m_lastSeq) - 1);
+        lost = quint8(seq - quint8(m_lastSeq) - 1);
+        m_lostFrames += lost;
     }
     m_lastSeq = seq;
+    m_performance->recordInput(perfNow, true, lost);
 
     /* 逐个按键比较，只有边沿才记事件并计数，心跳帧不会重复计数 */
     for (int i = 0; i < 10; ++i) {
@@ -854,6 +975,7 @@ void MainWindow::onClearCounters()
     m_testedSticks = 0;
     m_seenLedState = 0;
     m_rgbBaseline = m_hid.outOkCount();
+    m_performance->resetSession(m_hid.outOkCount());
     for (KeyIndicator *k : m_keys) k->resetCount();
     m_events.clear();
     m_uiDirty = true;
@@ -864,6 +986,7 @@ void MainWindow::onClearCounters()
 
 void MainWindow::updateStats()
 {
+    m_performance->tick(QDateTime::currentMSecsSinceEpoch(), m_hid.outOkCount());
     m_frameLabel->setText(QStringLiteral("报告 %1 帧").arg(m_frames));
     m_lostLabel->setText(QStringLiteral("丢帧 %1").arg(m_lostFrames));
     int tested = 0;
@@ -1083,26 +1206,41 @@ void MainWindow::onShowAssessment()
 
 void MainWindow::onExportReport()
 {
-    const QString path = QFileDialog::getSaveFileName(
-        this, QStringLiteral("导出考核验证报告"),
-        QStringLiteral("usb_keymouse_assessment_%1.txt")
+    QString selectedFilter;
+    QString path = QFileDialog::getSaveFileName(
+        this, QStringLiteral("导出性能与验收报告"),
+        QStringLiteral("usb_keymouse_performance_%1.html")
             .arg(QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss")),
-        QStringLiteral("文本报告 (*.txt)"));
+        QStringLiteral("HTML 报告 (*.html);;文本报告 (*.txt)"), &selectedFilter);
     if (path.isEmpty()) return;
+    const bool html = !path.endsWith(QStringLiteral(".txt"), Qt::CaseInsensitive)
+                      && !selectedFilter.startsWith(QStringLiteral("文本"));
+    if (!path.endsWith(QStringLiteral(".html"), Qt::CaseInsensitive)
+        && !path.endsWith(QStringLiteral(".txt"), Qt::CaseInsensitive))
+        path += html ? QStringLiteral(".html") : QStringLiteral(".txt");
+
     QFile file(path);
     if (!file.open(QIODevice::WriteOnly | QIODevice::Text)) {
         QMessageBox::warning(this, QStringLiteral("导出失败"), file.errorString());
         return;
     }
+    const QString functional = assessmentReport();
     QTextStream out(&file);
     out.setEncoding(QStringConverter::Utf8);
-    out << assessmentReport();
+    if (html) {
+        out << m_performance->reportHtml(
+            QStringLiteral("USB / 蓝牙双模键鼠"),
+            m_hid.info().product.isEmpty() ? QStringLiteral("双模复合键鼠") : m_hid.info().product,
+            m_connected ? m_hid.info().transportName() : QStringLiteral("未连接"), functional);
+    } else {
+        out << functional << m_performance->reportText();
+    }
     if (!file.flush()) {
         QMessageBox::warning(this, QStringLiteral("导出失败"), file.errorString());
         return;
     }
     file.close();
-    appendLog(QStringLiteral("SYS"), QStringLiteral("考核验证报告已导出：%1").arg(path));
+    appendLog(QStringLiteral("SYS"), QStringLiteral("性能与验收报告已导出：%1").arg(path));
     m_statusLabel->setText(QStringLiteral("报告已导出：%1").arg(path));
 }
 
@@ -1140,6 +1278,124 @@ void MainWindow::onRgbTestTick()
     }
     applyColor(colors[m_rgbTestStep][0], colors[m_rgbTestStep][1], colors[m_rgbTestStep][2], true);
     ++m_rgbTestStep;
+}
+
+void MainWindow::onConfigRead()
+{
+    if (!m_connected || m_hid.info().isBluetooth()) return;
+    m_configWaitingSave = false;
+    m_configPollTimer.stop();
+    if (!m_hid.requestFeatureReport()) {
+        m_configStatus->setText(QStringLiteral("读取请求入队失败，请重新连接 USB。"));
+        return;
+    }
+    m_configStatus->setText(QStringLiteral("正在读取设备配置…"));
+}
+
+void MainWindow::onConfigWrite()
+{
+    if (!m_connected || m_hid.info().isBluetooth()) return;
+    QByteArray cfg(Proto::kConfigSize, char(0));
+    cfg[0] = char(Proto::kConfigMagic);
+    cfg[1] = char(Proto::kConfigVersion);
+    cfg[2] = char(Proto::kConfigCmdSave);
+    for (int i = 0; i < 9; ++i)
+        Proto::put16(cfg, 4 + i * 2, quint16(m_actionCombos.at(i)->currentData().toUInt()));
+    for (int i = 0; i < 2; ++i) cfg[22 + i] = char(m_sens[i]->value());
+    Proto::put16(cfg, 24, quint16(m_deadzone[0]->value()));
+    Proto::put16(cfg, 26, quint16(m_deadzone[1]->value()));
+    Proto::sealConfig(cfg);
+    if (!m_hid.sendFeatureReport(QByteArray(1, char(0)) + cfg)) {
+        m_configStatus->setText(QStringLiteral("写入请求入队失败，请重新连接 USB。"));
+        return;
+    }
+    m_configStatus->setText(QStringLiteral("正在写入配置，随后确认 Flash 保存状态…"));
+}
+
+void MainWindow::onConfigDefault()
+{
+    if (!m_connected || m_hid.info().isBluetooth()) return;
+    QByteArray cfg = Proto::defaultConfig();
+    cfg[2] = char(Proto::kConfigCmdDefault);
+    Proto::sealConfig(cfg);
+    if (m_hid.sendFeatureReport(QByteArray(1, char(0)) + cfg))
+        m_configStatus->setText(QStringLiteral("正在恢复默认键位与摇杆参数并保存…"));
+}
+
+void MainWindow::onConfigPoll()
+{
+    if (!m_configWaitingSave || !m_connected) return;
+    if (!m_hid.requestFeatureReport()) {
+        m_configWaitingSave = false;
+        m_configStatus->setText(QStringLiteral("保存状态读取失败，请手动点击“读取配置”确认。"));
+    }
+}
+
+void MainWindow::onFeatureResult(bool success, bool write, const QByteArray &data, const QString &error)
+{
+    m_performance->recordFeature(write, success);
+    if (write) {
+        if (!success) {
+            m_configWaitingSave = false;
+            m_configPollTimer.stop();
+            m_configStatus->setText(QStringLiteral("配置写入失败：%1").arg(error));
+            return;
+        }
+        m_configWaitingSave = true;
+        m_configPolls = 0;
+        m_configPollTimer.start();
+        return;
+    }
+
+    if (!success || data.size() < Proto::kConfigXferSize) {
+        if (m_configWaitingSave && ++m_configPolls < 10) {
+            m_configPollTimer.start();
+            return;
+        }
+        m_configWaitingSave = false;
+        m_configPollTimer.stop();
+        m_configStatus->setText(QStringLiteral("配置读取失败：%1").arg(error.isEmpty() ? QStringLiteral("报告长度错误") : error));
+        return;
+    }
+
+    const QByteArray cfg = data.mid(1, Proto::kConfigSize);
+    if (!Proto::validConfig(cfg)) {
+        m_configWaitingSave = false;
+        m_configStatus->setText(QStringLiteral("设备配置校验失败，请确认已烧录支持配置的新固件。"));
+        return;
+    }
+    const int status = quint8(cfg.at(3));
+    if (m_configWaitingSave && status == 1) {
+        if (++m_configPolls >= 30) {
+            m_configWaitingSave = false;
+            m_configStatus->setText(QStringLiteral("等待 Flash 保存超时，请重新读取确认。"));
+        } else {
+            m_configPollTimer.start();
+        }
+        return;
+    }
+
+    const bool confirmed = m_configWaitingSave;
+    m_configWaitingSave = false;
+    m_configPollTimer.stop();
+    for (int i = 0; i < 9; ++i) {
+        const int index = m_actionCombos.at(i)->findData(Proto::get16(cfg, 4 + i * 2));
+        m_actionCombos.at(i)->setCurrentIndex(index >= 0 ? index : 0);
+    }
+    for (int i = 0; i < 2; ++i) m_sens[i]->setValue(quint8(cfg.at(22 + i)));
+    m_deadzone[0]->setValue(Proto::get16(cfg, 24));
+    m_deadzone[1]->setValue(Proto::get16(cfg, 26));
+
+    if (confirmed) {
+        m_configStatus->setText(status == 2
+            ? QStringLiteral("已应用并写入 Flash，断电后配置仍会保留。")
+            : QStringLiteral("配置已应用，但 Flash 保存失败；可再次点击“写入并保存”。"));
+    } else {
+        m_configStatus->setText(QStringLiteral("配置读取成功（灵敏度 %1% / %2%，死区 %3 / %4）。")
+            .arg(m_sens[0]->value()).arg(m_sens[1]->value())
+            .arg(m_deadzone[0]->value()).arg(m_deadzone[1]->value()));
+    }
+    appendLog(QStringLiteral("CFG"), m_configStatus->text());
 }
 
 void MainWindow::loadSettings()

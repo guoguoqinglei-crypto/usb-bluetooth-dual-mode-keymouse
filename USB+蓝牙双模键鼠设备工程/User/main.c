@@ -12,6 +12,7 @@
 #include <bt_uart.h>
 #include <Init_rda5876.h>
 #include <bt_hci.h>
+#include <km_config.h>
 
 #define UART_BAUD_RATE      921600U
 
@@ -52,6 +53,7 @@ static void vUsbTask(void *pvParameters)
     for (;;)
     {
         UsbHid_Task();
+        KMConfig_Process();             /* 控制回调只置标志，Flash 在任务上下文保存 */
         Joystick_AutoRecenter();        /* 静止时缓慢修正摇杆中位，消除光标自己漂移 */
         vTaskDelay(TASK_PERIOD_MS);
     }
@@ -141,6 +143,7 @@ int main(void)
     Joystick_Init();                /* 蓝牙上电前记录摇杆中点，与手柄工程一致 */
     Tim2_Init();
     Key_FSM_Init();
+    KMConfig_Init();                /* 无效或空记录自动使用原默认键位和摇杆参数 */
 
     UART1_SendString("\r\n[dual] USB / Bluetooth keyboard and mouse (FreeRTOS)\r\n");
 

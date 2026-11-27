@@ -11,6 +11,7 @@
 #include <usb_hid.h>        /* hal_time_ms() 时基 + UsbHid_IsMounted() 自动选路 */
 #include <Init_rda5876.h>   /* RDA_OK + Init_rda5876()：回连失败时重新初始化控制器 */
 #include <tim2.h>           /* 键盘 LED -> 板载 RGB（NumLock/CapsLock 指示） */
+#include <km_config.h>      /* 与 USB 共用的改键、摇杆响应和掉电配置 */
 
 #define BOND_FLASH_ADDR   0x0803F800u
 #define BOND_MAGIC        0x424F4E44u    /* "BOND" */
@@ -343,22 +344,7 @@ static void bt_rotate_axes(int32_t lx, int32_t ly, int32_t *mx, int32_t *my)
 
 static int8_t bt_axis_to_move(int32_t v)
 {
-    int32_t a = (v < 0) ? -v : v;
-    int32_t t;
-    int32_t n;
-    int32_t m;
-
-    if (a <= BT_JOY_DEADZONE)
-    {
-        return 0;
-    }
-    t = a - BT_JOY_DEADZONE;
-    n = 32767 - BT_JOY_DEADZONE;
-    m = (int32_t)(((int64_t)t * t * BT_JOY_MOUSE_MAX + (int64_t)n * n / 2) /
-                  ((int64_t)n * n));
-    if (m < 1) { m = 1; }
-    else if (m > BT_JOY_MOUSE_MAX) { m = BT_JOY_MOUSE_MAX; }
-    return (v < 0) ? (int8_t)(-m) : (int8_t)m;
+    return KMConfig_AxisToMove(v);   /* 与 USB 使用同一份运行配置和响应曲线 */
 }
 
 static uint8_t bt_read_key_bitmap(void)
@@ -376,14 +362,17 @@ static uint8_t bt_read_key_bitmap(void)
     return bm;
 }
 
-static void bt_send_keyboard_report(uint8_t bm, uint8_t modifier)
+static void bt_send_keyboard_report(uint8_t bm, uint8_t modifier, uint8_t joy)
 {
     s_lastTx = hal_time_ms();
     uint8_t rpt[10];
+    uint8_t keys[6];
     uint8_t n = 0u;
     uint8_t base;
+    uint8_t i;
 
     memset(rpt, 0, sizeof(rpt));
+    (void)KMConfig_BuildKeyboard(bm, joy, keys);
     rpt[0] = 0xA1u;
     if (g_bt_hid_protocol == HIDP_PROTOCOL_BOOT)
     {
@@ -394,11 +383,11 @@ static void bt_send_keyboard_report(uint8_t bm, uint8_t modifier)
         rpt[1] = BT_REPORT_KEYBOARD;
         base = 2u;
     }
-    rpt[base] = modifier;           /* L3=Left Shift，R3=Left Ctrl，可叠加 */
-    if ((bm & 0x04u) != 0u) { rpt[base + 2u + n++] = 0x39u; }
-    if ((bm & 0x08u) != 0u) { rpt[base + 2u + n++] = 0x53u; }
-    if ((bm & 0x10u) != 0u) { rpt[base + 2u + n++] = 0x2Cu; }
-    if ((bm & 0x20u) != 0u) { rpt[base + 2u + n++] = 0x28u; }
+    rpt[base] = modifier;
+    for (i = 0u; i < 6u; ++i)
+    {
+        if (keys[i] != 0u) { rpt[base + 2u + n++] = keys[i]; }
+    }
     bt_hid_send_report(rpt, (g_bt_hid_protocol == HIDP_PROTOCOL_BOOT) ? 9u : 10u);
 }
 
@@ -457,7 +446,7 @@ static void bt_release_inputs(void)
 {
     if (s_btActive != 0u)
     {
-        bt_send_keyboard_report(0u, 0u);
+        bt_send_keyboard_report(0u, 0u, 0u);
         bt_send_mouse_report(0u, 0, 0, 0);
         bt_send_custom_report(0u, UsbHid_GetKeyboardLeds(), 0u);
     }
@@ -641,15 +630,11 @@ static void bt_input_scan_and_send(uint32_t now)
     int8_t dy;
     int8_t wheel = 0;
 
-    if (Joystick_KeyIsDown(JOYSTICK_L3) != 0u)
+    if (Joystick_KeyIsDown(JOYSTICK_L3) != 0u) { joy |= 0x01u; }
+    if (Joystick_KeyIsDown(JOYSTICK_R3) != 0u) { joy |= 0x02u; }
     {
-        joy |= 0x01u;
-        modifier |= HID_MODIFIER_LEFT_SHIFT;
-    }
-    if (Joystick_KeyIsDown(JOYSTICK_R3) != 0u)
-    {
-        joy |= 0x02u;
-        modifier |= HID_MODIFIER_LEFT_CTRL;
+        uint8_t keys[6];
+        modifier = KMConfig_BuildKeyboard(bm, joy, keys);
     }
 
     s_btActive = 1u;
@@ -657,12 +642,10 @@ static void bt_input_scan_and_send(uint32_t now)
     {
         s_keyBm = bm;
         s_keyModifier = modifier;
-        bt_send_keyboard_report(bm, modifier);
+        bt_send_keyboard_report(bm, modifier, joy);
     }
 
-    if ((bm & 0x01u) != 0u) { buttons |= 0x01u; }
-    if ((bm & 0x02u) != 0u) { buttons |= 0x02u; }
-    if ((bm & 0x40u) != 0u) { buttons |= 0x04u; }
+    buttons = KMConfig_BuildMouse(bm, joy);
 
     lx = bt_mouse_read_axis(JOYSTICK_LX);
     ly = bt_mouse_read_axis(JOYSTICK_LY);
@@ -677,8 +660,7 @@ static void bt_input_scan_and_send(uint32_t now)
         ry = Joystick_MapRawValue(JOYSTICK_RY, Joystick_ReadAxis(JOYSTICK_RY));
         bt_rotate_axes(rx, ry, &wx, &wy);
         (void)wx;
-        if (wy > BT_WHEEL_THRESHOLD) { wheel = 1; }
-        else if (wy < -BT_WHEEL_THRESHOLD) { wheel = -1; }
+        wheel = KMConfig_Wheel(wy);
     }
 
     if ((dx != 0) || (dy != 0) || (wheel != 0) ||
@@ -709,7 +691,7 @@ static void bt_input_scan_and_send(uint32_t now)
      * 使用 Windows 始终读取的键盘集合，不用无人读取时会堆积的自定义集合。 */
     if ((uint32_t)(now - s_lastTx) >= REPORT_MS)
     {
-        bt_send_keyboard_report(s_keyBm, s_keyModifier);
+        bt_send_keyboard_report(s_keyBm, s_keyModifier, s_customJoy);
     }
 
     s_protoDirty = 0u;
@@ -907,7 +889,7 @@ void BT_Task(void)
                 /* 通道刚就绪：先发一帧"全部松开"，清掉主机侧可能残留的
                  * 按键/按钮状态（上一轮断开时如果按键正按着，主机可能
                  * 一直认为它还按着，表现为"按键后键鼠都不正常"）。 */
-                bt_send_keyboard_report(0u, 0u);
+                bt_send_keyboard_report(0u, 0u, 0u);
                 bt_send_mouse_report(0u, 0, 0, 0);
                 bt_send_custom_report(0u, UsbHid_GetKeyboardLeds(), 0u);
 
@@ -936,7 +918,7 @@ void BT_Task(void)
                  * 否则上位机未打开自定义集合时可能在主机侧堆积输入报告。 */
                 if ((uint32_t)(now - s_lastTx) >= REPORT_MS)
                 {
-                    bt_send_keyboard_report(0u, 0u);
+                    bt_send_keyboard_report(0u, 0u, 0u);
                 }
             }
             else
